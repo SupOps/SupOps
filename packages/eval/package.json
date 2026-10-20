@@ -1,0 +1,22 @@
+{
+  "name": "@supops/eval",
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "author": "Ayush Maheshwari (https://github.com/Ayyush-Maheshwari)",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "eval": "node --experimental-strip-types src/cli.ts"
+  },
+  "dependencies": {
+    "@supops/core": "*",
+    "@supops/db": "*",
+    "@supops/shared": "*",
+    "drizzle-orm": "^0.45.2"
+  }
+}
