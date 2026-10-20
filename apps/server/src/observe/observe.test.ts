@@ -30,6 +30,8 @@ const { cleanupObservability } = await import('@supops/core');
 let firing: Array<Record<string, unknown>> = [];
 /** The disk the fake backend reports: free bytes now, and losing this many per second. */
 let disk = { now: 20e9, perSecond: -1e9 / 3600 };
+/** A disk-usage percent the fake backend reports: level now, and this trend per hour. */
+let pct = { now: 50, perHour: 0 };
 const vector = (v: number) => ({ status: 'success', data: { resultType: 'vector', result: [{ metric: { instance: 'web-1:9100', mountpoint: '/var' }, value: [0, String(v)] }] } });
 let server: Server;
 let base = '';
@@ -46,6 +48,25 @@ before(async () => {
       if (q.includes('offset 1d')) return send(vector(disk.now - disk.perSecond * 86_400));
       if (q.startsWith('deriv')) return send(vector(disk.perSecond));
       return send(vector(disk.now));
+    }
+    // A disk-usage percent, both instant (with its trend extras) and as 15 days of history.
+    if (q.includes('supops_disk_pct')) {
+      const metric = { instance: 'web-1:9100', mountpoint: '/' };
+      if (url.pathname === '/api/v1/query_range') {
+        const start = Number(url.searchParams.get('start'));
+        const end = Number(url.searchParams.get('end'));
+        const step = Number((url.searchParams.get('step') ?? '3600s').replace('s', '')) || 3600;
+        const values: Array<[number, string]> = [];
+        for (let t = start; t <= end; t += step) values.push([t, String(pct.now - pct.perHour * ((end - t) / 3600))]);
+        return send({ status: 'success', data: { resultType: 'matrix', result: [{ metric, values }] } });
+      }
+      if (url.pathname === '/api/v1/query') {
+        const one = (v: number) => send({ status: 'success', data: { resultType: 'vector', result: [{ metric, value: [0, String(v)] }] } });
+        if (q.startsWith('stddev_over_time')) return one(0.5);
+        if (q.startsWith('deriv')) return one(pct.perHour / 3600);
+        // avg/min/max over any window, and "offset 1d", all read as the current level.
+        return one(pct.now);
+      }
     }
     if (url.pathname === '/api/v1/query') return send({ status: 'success', data: { resultType: 'vector', result: [] } });
     res.writeHead(404).end('{}');
@@ -204,6 +225,39 @@ test('the watcher scores every series and opens a predicted incident before a di
   // And the 15-day clean-up leaves recent data alone.
   const r = cleanupObservability(db, { days: 15 });
   assert.equal(r.incidents, 0);
+});
+
+test('a cleaned-up percent signal drops its stale forecast, not "reaches its limit now"', async () => {
+  const { projectId, prom } = seed();
+  const conn = projectConnections(projectId).find((c) => c.id === prom.id)!;
+  // Disk usage climbing toward its 80% limit: the fitted model opens a forecast and is cached.
+  pct = { now: 79, perHour: 0.1 };
+  const w = db.insert(watches).values({
+    projectId, connectionId: prom.id, key: 'custom:diskpct', title: 'Disk used', query: 'supops_disk_pct', unit: 'percent',
+    builtin: false, badDirection: 'up', limit: { value: 80, when: 'above' }, group: 'custom',
+  }).returning().get();
+
+  await sampleWatch(w, conn);
+  const r1 = db.select().from(watchSeries).where(eq(watchSeries.watchId, w.id)).get()!;
+  assert.match(r1.reasons.join(' '), /reaches its limit|over its limit/, 'near its limit, a forecast is raised');
+  assert.ok(
+    db.select().from(observations).where(and(eq(observations.watchId, w.id), eq(observations.kind, 'forecast'), isNull(observations.resolvedAt))).get(),
+    'a forecast observation is open',
+  );
+
+  // Cleaned up to 34.5% minutes later. The model from the last hour is now stale; the next
+  // scan must refit it, not keep pinning "reaches its limit now" on a series with 45% headroom.
+  pct = { now: 34.5, perHour: 0 };
+  await sampleWatch(db.select().from(watches).where(eq(watches.id, w.id)).get()!, conn, Date.now() + 5 * 60_000);
+
+  const r2 = db.select().from(watchSeries).where(eq(watchSeries.watchId, w.id)).get()!;
+  assert.equal(r2.value, 34.5);
+  assert.equal(r2.etaMs, null, 'the forecast eta is cleared');
+  assert.doesNotMatch(r2.reasons.join(' '), /reaches its limit|over its limit/, 'no stale forecast on a cleaned-up disk');
+  assert.ok(
+    !db.select().from(observations).where(and(eq(observations.watchId, w.id), eq(observations.kind, 'forecast'), isNull(observations.resolvedAt))).get(),
+    'the forecast observation is resolved',
+  );
 });
 
 /** Ignore an incident the way the route does. */

@@ -85,13 +85,24 @@ function modelCandidates(w: WatchRow, series: ScanSeries[], fl: boolean, open: S
  * Fit the model for the candidates whose fit is missing or older than an hour:
  * hourly means over the last 15 days, read in chunks of 20 series.
  */
-async function modelsFor(w: WatchRow, conn: ResolvedTarget, candidates: ScanSeries[], now: number): Promise<Map<string, Prediction | null>> {
+async function modelsFor(w: WatchRow, conn: ResolvedTarget, candidates: ScanSeries[], now: number, fl: boolean): Promise<Map<string, Prediction | null>> {
   const limit = w.limit!;
   const limitKey = JSON.stringify(limit);
   let cache = modelCache.get(w.id);
   if (!cache || now - cache.at > MODEL_TTL || cache.query !== w.query || cache.limit !== limitKey) {
     cache = { at: now, query: w.query, limit: limitKey, byKey: new Map() };
     modelCache.set(w.id, cache);
+  }
+  // A cached fit predates a level shift when the fresh sample has moved far from the level
+  // it left off at (e.g. a disk cleaned up from 80% to 35%). Drop it so it refits from the
+  // new history -- otherwise a stale "reaches its limit now" keeps being pinned on a series
+  // that is no longer anywhere near its limit.
+  const freshLevel = (s: ScanSeries) => (fl ? (s.avg15m ?? s.value) : s.value);
+  for (const s of candidates) {
+    const p = cache.byKey.get(s.key);
+    if (!p) continue;
+    const scale = Math.max(Math.abs(limit.value - p.level), Math.abs(p.level) * 0.1, 1e-9);
+    if (Math.abs(freshLevel(s) - p.level) > 0.25 * scale) cache.byKey.delete(s.key);
   }
   const missing = candidates.filter((s) => !cache!.byKey.has(s.key));
   const minRise = SIGNALS.find((x) => x.key === w.key)?.minDelta ?? 0;
@@ -197,7 +208,7 @@ export async function sampleWatch(w: WatchRow, conn: ResolvedTarget, now = Date.
         .where(and(eq(observations.watchId, w.id), eq(observations.kind, 'forecast'), isNull(observations.resolvedAt))).all().map((o) => o.series),
     );
     try {
-      models = await modelsFor(w, conn, modelCandidates(w, r.series, fl, openF), now);
+      models = await modelsFor(w, conn, modelCandidates(w, r.series, fl, openF), now, fl);
     } catch (err) {
       console.warn(`  ! forecast model for ${w.title}: ${err instanceof Error ? err.message : err}`);
     }

@@ -337,6 +337,8 @@ function SignalDetail({
     // Fetched even with one series picked: it fixes each series' colour.
     enabled: w.enabled && w.series.length > 1,
     staleTime: 60_000,
+    // Refresh on the same cadence as the list, so the graph never trails the headline.
+    refetchInterval: 60_000,
   });
   // A series keeps its colour between the graph and the list.
   const colorOf = useMemo(() => new Map((combined.data?.series ?? []).map((s, i) => [s.key, seriesColor(i)])), [combined.data]);
@@ -518,6 +520,8 @@ function SingleChart({ watch: w, item, hours, color }: { watch: Watch; item: Wat
     queryKey: ['seriesChart', w.id, item.key, hours],
     queryFn: () => api<SeriesChartData>(`/observability/watches/${w.id}/chart?key=${encodeURIComponent(item.key)}&hours=${hours}`),
     staleTime: 60_000,
+    // Refresh on the same cadence as the list, so the graph never trails the headline.
+    refetchInterval: 60_000,
   });
   const investigate = useMutation({
     mutationFn: () => post<{ runId: string }>(`/observability/watches/${w.id}/investigate`, { key: item.key }),
