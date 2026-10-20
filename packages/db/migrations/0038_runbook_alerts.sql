@@ -1,0 +1,1 @@
+ALTER TABLE `knowledge_docs` ADD `alert_match` text;

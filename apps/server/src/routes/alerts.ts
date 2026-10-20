@@ -1,7 +1,7 @@
 import { Router } from 'express';
-import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNotNull, isNull, not, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { agents, alerts, incidents } from '@supops/db';
+import { agents, alertIntegrations, alerts, incidents, maintenanceWindows } from '@supops/db';
 import type { AlertStatus } from '@supops/shared';
 import { loadTargets, scopeAlert } from '@supops/core';
 import { db } from '../context.ts';
@@ -23,8 +23,12 @@ alertRoutes.get('/', (req, res) => {
 
   const where = [eq(alerts.projectId, projectId)];
   // Default view: what still needs a decision. `status=all` shows history too.
-  if (status && (status as string) !== 'all') where.push(eq(alerts.status, status));
+  // Alerts muted by a maintenance window have their own view; they are not news.
+  const muted = and(isNotNull(alerts.maintenanceId), isNull(alerts.incidentId), isNull(alerts.resolvedAt));
+  if ((status as string) === 'maintenance') where.push(muted!);
+  else if (status && (status as string) !== 'all') where.push(eq(alerts.status, status));
   else if (!status) where.push(inArray(alerts.status, ['new', 'investigating']));
+  if (status === 'new' || status === 'investigating' || !status) where.push(not(muted!));
   if (channel) where.push(eq(alerts.channelId, channel));
 
   const rows = db
@@ -40,9 +44,14 @@ alertRoutes.get('/', (req, res) => {
   const byStatus = db
     .select({ status: alerts.status, n: sql<number>`count(*)` })
     .from(alerts)
-    .where(eq(alerts.projectId, projectId))
+    .where(and(eq(alerts.projectId, projectId), not(muted!)))
     .groupBy(alerts.status)
     .all();
+  const mutedCount = db.select({ n: sql<number>`count(*)` }).from(alerts).where(and(eq(alerts.projectId, projectId), muted!)).get()?.n ?? 0;
+  const windowIds = [...new Set(rows.map((r) => r.maintenanceId).filter((x): x is string => !!x))];
+  const windowNames = new Map(
+    (windowIds.length ? db.select({ id: maintenanceWindows.id, name: maintenanceWindows.name }).from(maintenanceWindows).where(inArray(maintenanceWindows.id, windowIds)).all() : []).map((w) => [w.id, w.name]),
+  );
   const channels = db
     .selectDistinct({ channelId: alerts.channelId, channelName: alerts.channelName })
     .from(alerts)
@@ -56,9 +65,19 @@ alertRoutes.get('/', (req, res) => {
       .map((d) => [d.id, d]),
   );
 
+  const senderIds = [...new Set(rows.map((r) => r.integrationId).filter((x): x is string => !!x))];
+  const senders = new Map(
+    (senderIds.length ? db.select({ id: alertIntegrations.id, name: alertIntegrations.name }).from(alertIntegrations).where(inArray(alertIntegrations.id, senderIds)).all() : []).map((s) => [s.id, s.name]),
+  );
+
   res.json({
-    alerts: rows.map((r) => ({ ...r, diagnosis: r.incidentId ? diag.get(r.incidentId) ?? null : null })),
-    statusCounts: Object.fromEntries(byStatus.map((r) => [r.status, r.n])),
+    alerts: rows.map((r) => ({
+      ...r,
+      sourceName: r.integrationId ? senders.get(r.integrationId) ?? null : null,
+      maintenanceName: r.maintenanceId ? windowNames.get(r.maintenanceId) ?? null : null,
+      diagnosis: r.incidentId ? diag.get(r.incidentId) ?? null : null,
+    })),
+    statusCounts: { ...Object.fromEntries(byStatus.map((r) => [r.status, r.n])), maintenance: mutedCount },
     channels: channels.filter((c) => c.channelId),
   });
 });
@@ -73,7 +92,7 @@ alertRoutes.get('/count', (req, res) => {
   const row = db
     .select({ n: sql<number>`count(*)` })
     .from(alerts)
-    .where(and(eq(alerts.projectId, projectId), eq(alerts.status, 'new')))
+    .where(and(eq(alerts.projectId, projectId), eq(alerts.status, 'new'), isNull(alerts.maintenanceId)))
     .get();
   res.json({ new: row?.n ?? 0 });
 });

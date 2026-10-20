@@ -6,6 +6,8 @@ import { db, settingsStore } from '../context.ts';
 import { importsAlerts, projectConnections } from './connections.ts';
 import { ingestAlert } from './ingest.ts';
 import { refreshIncident } from './incidents.ts';
+import { settleFlapping } from './flapping.ts';
+import { releaseEndedWindows } from './maintenance.ts';
 
 /**
  * Reads firing alerts from every connection that imports them (Alertmanager by
@@ -85,6 +87,13 @@ export class AlertPoller {
   }
 
   private async tick(): Promise<void> {
+    // Every tick, not every poll: flapping settles and maintenance ends on time, whatever the poll interval.
+    try {
+      settleFlapping();
+      releaseEndedWindows();
+    } catch (err) {
+      console.error('alert housekeeping failed:', err);
+    }
     if (this.busy || Date.now() < this.nextAt) return;
     this.busy = true;
     this.nextAt = Date.now() + settingsStore.observability().alertPollMs;
