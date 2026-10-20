@@ -16,3 +16,6 @@ supops-brag.*
 
 # Per-machine settings (e.g. AUTH_ALLOWED_EMAIL_DOMAIN) stay out of the repo
 docker-compose.override.yml
+
+# Accuracy eval reports (npm run eval)
+eval-results/

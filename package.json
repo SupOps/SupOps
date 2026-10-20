@@ -6,7 +6,8 @@
   "type": "module",
   "workspaces": [
     "packages/*",
-    "apps/*"
+    "apps/server",
+    "apps/web"
   ],
   "engines": {
     "node": ">=22"
@@ -19,8 +20,9 @@
     "db:migrate": "npm run db:migrate --workspace=@supops/db",
     "seed": "npm run seed --workspace=@supops/server",
     "test": "node --test --experimental-strip-types \"packages/**/*.test.ts\" \"apps/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit -p packages/shared && tsc --noEmit -p packages/db && tsc --noEmit -p packages/core && tsc --noEmit -p apps/server && tsc --noEmit -p apps/web",
-    "add-key": "npm run add-key --workspace=@supops/server --"
+    "typecheck": "tsc --noEmit -p packages/shared && tsc --noEmit -p packages/db && tsc --noEmit -p packages/core && tsc --noEmit -p packages/eval && tsc --noEmit -p apps/server && tsc --noEmit -p apps/web",
+    "add-key": "npm run add-key --workspace=@supops/server --",
+    "eval": "npm run eval --workspace=@supops/eval --"
   },
   "devDependencies": {
     "typescript": "^5.7.2",
