@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { knowledgeDocs, runKnowledge, runs } from '@supops/db';
-import { searchKnowledge } from '@supops/core';
+import { parseAlertSpec, searchKnowledge } from '@supops/core';
 import { isAdmin } from '../auth.ts';
 import { db } from '../context.ts';
 import { audit } from '../services/audit.ts';
@@ -34,6 +34,18 @@ const docBody = z.object({
   tags: z.array(z.string().min(1).max(40)).max(20).default([]),
   scope,
   pinned: z.boolean().optional(),
+  /** Runbooks: the alerts it is for (names or Alertmanager matchers). Empty clears it. */
+  alertMatch: z
+    .string()
+    .trim()
+    .max(2000)
+    .nullable()
+    .optional()
+    .superRefine((v, ctx) => {
+      const p = v ? parseAlertSpec(v) : null;
+      if (p && !p.ok) ctx.addIssue({ code: 'custom', message: `Alerts it is for: ${p.error}` });
+    })
+    .transform((v) => (v === undefined ? undefined : v || null)),
 });
 
 knowledgeRoutes.get('/', (req, res) => {

@@ -5,12 +5,12 @@ import { clsx } from 'clsx';
 import { THREAT_LABEL, messageText, stripAnsi } from '@supops/shared';
 import {
   AlertTriangle, ArrowLeft, Ban, BookOpen, Bot, Check, ChevronDown, ChevronRight, CircleSlash, Pin, PinOff,
-  Info, Radio, Server, ShieldAlert, ShieldCheck, Terminal, User, X,
+  Anchor, Cpu, Eraser, FilePen, FileX, FlaskConical, Globe, Info, KeyRound, Network, Package, Radio, Server, ShieldAlert, ShieldCheck, Terminal, User, X,
 } from 'lucide-react';
 import { api, post } from '../lib/api';
 import { useRunStream } from '../lib/useRunStream';
 import { cleanTask, duration, splitOpening, timeAgo } from '../lib/format';
-import { CommandBlock, Panel, RiskBadge, Spinner, StatusPill } from '../components/ui';
+import { CallCommand, CommandBlock, Panel, RiskBadge, Spinner, StatusPill } from '../components/ui';
 import { Markdown } from '../components/Markdown';
 import { TrustDialog, TrustedChip, canTrust } from '../components/TrustDialog';
 import { RiskBar } from '../components/viz';
@@ -21,6 +21,7 @@ import { UserContent } from '../components/Attachments';
 import { Composer } from '../components/Composer';
 import { FeedbackBar } from '../components/FeedbackBar';
 import { useImageAttachments } from '../lib/images';
+import { PLAN_TOOL, PlanCard, PlanLine, runPlan } from '../components/RunPlan';
 import type { RunDetail as RunDetailData, ToolCall } from '../lib/types';
 
 export function RunDetail() {
@@ -80,6 +81,9 @@ export function RunDetail() {
   }, [isLive, id, qc]);
 
   const [followUpText, setFollowUpText] = useState('');
+  // "agent" is the normal conversation timeline; "sandbox" re-frames the run as what the
+  // sandbox observed (or why it couldn't) for each command -- the "what it would do" lens.
+  const [view, setView] = useState<'agent' | 'sandbox'>('agent');
   const att = useImageAttachments();
   const followUp = useMutation({
     mutationFn: (text: string) =>
@@ -115,7 +119,8 @@ export function RunDetail() {
   const acted = new Set(
     detail.data.toolCalls
       .map((c) => (c.argsJson as { target?: string }).target)
-      .filter((t): t is string => !!t),
+      // SupOps itself (plans, MCP tools, network checks) is not one of the project's machines.
+      .filter((t): t is string => !!t && t !== 'supops-server'),
   );
   const primary = snapshot.filter((t) => !/^Behind\s/.test(t.description ?? '')).map((t) => t.slug);
   const shownTargets = [...new Set([...primary, ...acted])];
@@ -223,6 +228,13 @@ export function RunDetail() {
             </dl>
           </div>
         )}
+        {/* Calls in the order they were made (the list is per step), for the latest plan.
+            Falls back to the steps the agent seeded via confirm_target when it has not yet
+            called update_plan, so a multi-part task shows its plan from the start. */}
+        {(() => {
+          const plan = runPlan(detail.data.steps.flatMap((s) => (s.messageJson.role === 'assistant' ? (s.messageJson.tool_calls ?? []) : []).map((tc) => callsById.get(tc.id)).filter((c): c is ToolCall => !!c)));
+          return <PlanCard steps={plan.steps} live={!!isLive} seeded={plan.seeded} />;
+        })()}
       </header>
       {/* Why a run only told you what was wrong, and how to let it fix things. */}
       {(advisory || readOnly) && !isLive && (
@@ -247,6 +259,11 @@ export function RunDetail() {
       )}
 
       <div className={clsx('mx-auto w-full max-w-4xl space-y-3 px-6 pt-6', canFollowUp ? 'pb-1' : 'pb-6')}>
+        {detail.data.toolCalls.length > 0 && <ViewToggle view={view} onChange={setView} />}
+        {view === 'sandbox' ? (
+          <SandboxMode calls={detail.data.toolCalls} />
+        ) : (
+          <>
         {detail.data.steps.map((step) => {
           const m = step.messageJson;
 
@@ -282,7 +299,8 @@ export function RunDetail() {
               )}
               {m.tool_calls?.map((tc) => {
                 const call = callsById.get(tc.id);
-                return call ? <ToolCallCard key={tc.id} call={call} /> : null;
+                if (!call) return null;
+                return call.toolKey === PLAN_TOOL && call.state === 'succeeded' ? <PlanLine key={tc.id} call={call} /> : <ToolCallCard key={tc.id} call={call} />;
               })}
             </div>
           );
@@ -293,6 +311,8 @@ export function RunDetail() {
             <Spinner className="text-blue-text" />
             {run.status === 'awaiting_approval' ? 'Waiting for a decision…' : 'Working…'}
           </div>
+        )}
+          </>
         )}
 
         {/* Keep the conversation going after the agent's final answer. The whole
@@ -341,8 +361,9 @@ function RunContext({ context, advisory, networkChecks, targets, knowledge }: {
 }) {
   const [open, setOpen] = useState(false);
   if (!context) return null;
-  const runbook = knowledge.find((k) => k.via === 'runbook');
-  const docs = knowledge.filter((k) => k.via !== 'runbook');
+  // 'alert': the runbook written for the incident's alerts, followed like a chosen one.
+  const runbook = knowledge.find((k) => k.via === 'runbook' || k.via === 'alert');
+  const docs = knowledge.filter((k) => k !== runbook);
   const shown = docs.slice(0, 5);
   return (
     <div className="mt-3 border-t border-hairline pt-2.5 text-[11px] text-muted">
@@ -351,7 +372,7 @@ function RunContext({ context, advisory, networkChecks, targets, knowledge }: {
           {advisory ? `Advisory${networkChecks ? ' · network checks on' : ' · no network checks'}` : targets.length ? `Targets: ${targets.join(', ')}` : 'All targets'}
         </span>
         {runbook && (
-          <span className="inline-flex items-center gap-1 text-ink"><BookOpen size={11} className="text-cyan" /> Following {runbook.title}</span>
+          <span className="inline-flex items-center gap-1 text-ink"><BookOpen size={11} className="text-cyan" /> Following {runbook.title}{runbook.via === 'alert' ? ' (written for these alerts)' : ''}</span>
         )}
         {!!docs.length && (
           <span className="inline-flex flex-wrap items-center gap-1">
@@ -430,6 +451,137 @@ function SystemStep({ content }: { content: string }) {
  * risk tier. The approve/reject controls are here rather than on a separate screen
  * so the decision is made in context.
  */
+/** A friendly name for which sandbox ran, from the simulator id. */
+function sandboxLabel(simulator: string | null): string {
+  if (!simulator) return 'sandbox';
+  if (simulator.startsWith('detonate/')) return `detonated in a sandbox${simulator.endsWith('gvisor') ? ' (gVisor)' : ''}`;
+  if (simulator === 'shadow') return 'target shadow — the real command, writes thrown away';
+  if (simulator === 'kubectl-dry-run') return 'server dry-run';
+  return 'dry-run';
+}
+
+/** An icon per observation kind, so the sandbox report reads at a glance. */
+const OBS_ICON: Record<string, typeof Info> = {
+  'file.delete': FileX, 'file.write': FilePen, 'pkg.remove': Package, 'pkg.install': Package,
+  persistence: Anchor, 'anti-forensics': Eraser, 'net.connect': Globe, exfil: Globe,
+  privilege: KeyRound, miner: Cpu, 'deps.reverse': Network, 'k8s.apply': Server, 'k8s.reject': Server,
+  clean: Check,
+};
+
+/** The "what it would actually do" sandbox view: the command that ran, and what it did. */
+function SandboxView({ observed }: { observed: NonNullable<ToolCall['riskJson']>['observed'] }) {
+  if (!observed || observed.status === 'skipped') return null;
+  const raised = new Set(['file.delete', 'persistence', 'anti-forensics', 'net.connect', 'exfil', 'privilege', 'miner']);
+  return (
+    <div className="overflow-hidden rounded-lg border border-cyan/25 bg-cyan/[0.04]">
+      <div className="flex items-center gap-1.5 border-b border-cyan/15 bg-cyan/[0.06] px-3 py-1.5 text-xs font-medium text-ink/90">
+        <FlaskConical size={13} className="text-cyan" /> What it would actually do
+        <span className="text-[11px] font-normal text-muted">· {sandboxLabel(observed.simulator)}</span>
+      </div>
+      <div className="space-y-2.5 p-3">
+        {observed.command && (
+          <div>
+            <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted">Ran in the sandbox</div>
+            <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-inner border border-hairline bg-ground/70 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-ink/90">{observed.command}</pre>
+          </div>
+        )}
+        {observed.items.length > 0 ? (
+          <ul className="space-y-1.5">
+            {observed.items.map((o, i) => {
+              const Icon = OBS_ICON[o.kind] ?? Info;
+              const danger = raised.has(o.kind);
+              return (
+                <li key={i} className="flex items-start gap-2 text-xs">
+                  <Icon size={14} className={clsx('mt-0.5 shrink-0', danger ? 'text-amber' : 'text-muted')} />
+                  <span className={clsx(danger ? 'text-ink' : 'text-ink/80')}>{o.detail}</span>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p className="text-xs text-muted">{observed.note ?? 'The sandbox could not run this action, so it was not observed.'}</p>
+        )}
+        {observed.blindSpots?.length ? (
+          <p className="flex items-start gap-1.5 border-t border-cyan/15 pt-2 text-[11px] text-muted">
+            <Info size={12} className="mt-0.5 shrink-0" /> Not observed: {observed.blindSpots.join('; ')}.
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/** The segmented Agent | Sandbox switch for the run view. */
+function ViewToggle({ view, onChange }: { view: 'agent' | 'sandbox'; onChange: (v: 'agent' | 'sandbox') => void }) {
+  const opt = (v: 'agent' | 'sandbox', label: string, Icon: typeof Bot) => (
+    <button
+      type="button"
+      onClick={() => onChange(v)}
+      aria-pressed={view === v}
+      className={clsx(
+        'flex items-center gap-1.5 rounded-inner px-3 py-1 text-xs font-medium transition-colors',
+        view === v ? 'bg-tile text-ink shadow-sm' : 'text-muted hover:text-ink',
+      )}
+    >
+      <Icon size={13} /> {label}
+    </button>
+  );
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 pb-1">
+      <div className="inline-flex items-center gap-0.5 rounded-tile border border-hairline bg-ground/60 p-0.5">
+        {opt('agent', 'Agent', Bot)}
+        {opt('sandbox', 'Sandbox', FlaskConical)}
+      </div>
+      {view === 'sandbox' && <span className="text-[11px] text-muted">What each command would actually do, before it runs</span>}
+    </div>
+  );
+}
+
+/** Calls that are real commands a sandbox could observe (not SupOps' own bookkeeping). */
+const BOOKKEEPING_KEYS = new Set(['update_plan', 'record_finding', 'confirm_target', 'read_output', 'search_knowledge', 'read_knowledge']);
+
+/** Why a command was not observed in the sandbox -- stated plainly, never implying "safe". */
+function NotSimulated({ call }: { call: ToolCall }) {
+  const reason =
+    call.tier === 'read_only'
+      ? 'Read-only — not run in a sandbox because it only reads; there is nothing to observe.'
+      : call.state === 'failed' || call.state === 'blocked'
+        ? 'Not run in a sandbox — the command did not execute.'
+        : 'Not observed — no built-in dry-run matched this command and no sandbox backend is configured. Turn on the detonator or target-shadow to observe commands like this.';
+  return (
+    <p className="flex items-start gap-1.5 rounded-lg border border-hairline bg-ground/40 px-3 py-2 text-xs text-muted">
+      <FlaskConical size={13} className="mt-0.5 shrink-0 text-muted/70" /> {reason}
+    </p>
+  );
+}
+
+/**
+ * The run seen through the sandbox: every command the agent ran, with what the sandbox
+ * observed -- or, when it was not simulated, an honest line saying why. The "see inside
+ * the sandbox" lens; the Agent view is the normal conversation timeline.
+ */
+function SandboxMode({ calls }: { calls: ToolCall[] }) {
+  const commands = calls.filter((c) => !BOOKKEEPING_KEYS.has(c.toolKey) && c.renderedCommand);
+  if (!commands.length) return <p className="px-1 py-6 text-sm text-muted">This run had no commands to run in a sandbox.</p>;
+  return (
+    <div className="space-y-3">
+      {commands.map((call) => {
+        const observed = call.riskJson?.observed;
+        const simulated = observed && observed.status !== 'skipped';
+        return (
+          <div key={call.toolCallId} className="space-y-2 rounded-tile border border-hairline bg-tile px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <RiskBadge tier={call.tier} />
+              <CallCommand call={call} className="min-w-0" />
+            </div>
+            {simulated ? <SandboxView observed={observed} /> : <NotSimulated call={call} />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ToolCallCard({ call }: { call: ToolCall }) {
   const qc = useQueryClient();
   const [comment, setComment] = useState('');
@@ -477,7 +629,7 @@ function ToolCallCard({ call }: { call: ToolCall }) {
       </div>
 
       <div className="space-y-3 p-4">
-        <CommandBlock>{call.renderedCommand ?? JSON.stringify(call.argsJson)}</CommandBlock>
+        <CallCommand call={call} />
 
         {(args.intent || args.expected_effect) && (
           <dl className="grid gap-2 text-xs sm:grid-cols-2">
@@ -532,11 +684,15 @@ function ToolCallCard({ call }: { call: ToolCall }) {
           </div>
         )}
 
+        {/* What a shadow/dry-run/detonation simulation actually observed before approval. */}
+        <SandboxView observed={call.riskJson?.observed} />
+
         {waiting && (
           <div className="space-y-2 rounded-lg border border-amber/30 bg-amber/5 p-3">
             <div className="flex items-center gap-1.5 text-xs font-medium text-amber">
               <AlertTriangle size={13} /> This action needs your approval before it runs
             </div>
+            {call.riskJson?.preflight && <p className="text-xs text-amber">{call.riskJson.preflight} Consider asking the agent to look first.</p>}
             <input
               className="input"
               placeholder="Optional note — the agent reads this if you reject"

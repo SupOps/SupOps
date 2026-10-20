@@ -13,6 +13,7 @@ import { Empty, Panel, Spinner, StatusPill } from '../components/ui';
 import { RiskBar } from '../components/viz';
 
 import type { Run } from '../lib/types';
+import { useLivePoll } from '../lib/live';
 
 const WINDOWS = [
   { label: 'All finished', days: 0 },
@@ -36,7 +37,7 @@ export function Runs() {
     queryKey: ['runs', projectId],
     queryFn: () => api<Run[]>(`/runs?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 4000,
+    refetchInterval: useLivePoll(4000),
   });
 
   const invalidate = () => {

@@ -459,7 +459,7 @@ export function displayCommand(c: ReportToolCall): string {
 
 /** Only real commands can be cited as evidence (not findings or confirmations). */
 export const isCommand = (c: ReportToolCall | undefined): boolean =>
-  !!c && c.toolKey !== 'record_finding' && c.toolKey !== 'confirm_target';
+  !!c && c.toolKey !== 'record_finding' && c.toolKey !== 'confirm_target' && c.toolKey !== 'update_plan';
 
 /** What a tool call was, in words a reader recognises. */
 export const TOOL_LABEL: Record<string, string> = {
@@ -496,7 +496,7 @@ export function citedCalls(input: ReportInput, doc: ReportDoc): number[] {
   // Nothing cited (e.g. mechanical fallback on a read-only run): show the first reads.
   if (!cited.size) {
     input.toolCalls.forEach((c, i) => {
-      if (cited.size < 6 && c.toolKey !== 'record_finding' && c.resultJson) cited.add(i + 1);
+      if (cited.size < 6 && c.toolKey !== 'record_finding' && c.toolKey !== 'update_plan' && c.resultJson) cited.add(i + 1);
     });
   }
   return [...cited].filter((n) => input.toolCalls[n - 1] && input.toolCalls[n - 1]!.toolKey !== 'record_finding').sort((a, b) => a - b).slice(0, 12);
@@ -516,7 +516,7 @@ export function humanDuration(ms: number): string {
 
 /** The headline numbers every report shows as tiles, straight from the execution record. */
 export function runFacts(input: ReportInput) {
-  const calls = input.toolCalls.filter((c) => c.toolKey !== 'record_finding' && c.toolKey !== 'confirm_target');
+  const calls = input.toolCalls.filter((c) => c.toolKey !== 'record_finding' && c.toolKey !== 'confirm_target' && c.toolKey !== 'update_plan');
   const ran = calls.filter((c) => c.state === 'succeeded' || c.state === 'failed');
   const changes = ran.filter((c) => c.tier && c.tier !== 'read_only');
   const refused = calls.filter((c) => c.state === 'denied' || c.state === 'expired' || c.state === 'blocked');

@@ -1,6 +1,6 @@
 import type { Db } from '@supops/db';
 import type { ToolOutput } from '@supops/db';
-import type { KnowledgeAccess, ResolvedTarget, ResolvedTool } from '../tools/types.ts';
+import type { KnowledgeAccess, OutputAccess, ResolvedTarget, ResolvedTool } from '../tools/types.ts';
 import { AnsiStripper, errOutput, redactSecrets, redactTokenPatterns, stripAnsi } from '../tools/output.ts';
 import { pinHostKey, pinnedHostKey, resolveBecomeSecrets, resolveSecret } from './targets.ts';
 import { hashArgs, targetFingerprint } from './canonical.ts';
@@ -24,6 +24,8 @@ export interface ExecuteParams {
   signal: AbortSignal;
   /** For knowledge tools: the run's approved knowledge, scoped by the engine. */
   knowledge?: KnowledgeAccess;
+  /** For read_output: this run's own earlier results. */
+  outputs?: OutputAccess;
 }
 
 export class ToolExecutionRefused extends Error {
@@ -123,6 +125,7 @@ export async function executeToolCall(
       maxOutputBytes: deps.maxOutputBytes,
       signal,
       ...(params.knowledge ? { knowledge: params.knowledge } : {}),
+      ...(params.outputs ? { outputs: params.outputs } : {}),
       ...(onChunk
         ? {
             onChunk: (chunk: string) => {

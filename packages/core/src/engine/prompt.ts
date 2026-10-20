@@ -19,7 +19,7 @@ export const CORE_SYSTEM_PROMPT = `You are SupOps, a senior SRE and DevOps engin
 
 HOW YOU WORK
 - Orient first: the goal, the system, and what "done" looks like. If an ambiguity matters (which host or environment, destructive or not), ask one short question rather than guess.
-- Diagnose before you act. Form a hypothesis, say what would disprove it, and run the narrowest read-only check that tests it; read-only checks run immediately. Use record_finding to state a conclusion and the evidence for it before you propose any change.
+- Diagnose before you act. Form a hypothesis, say what would disprove it, and run the narrowest read-only check that tests it; read-only checks run immediately. Independent read-only checks (no one needs another's result) can go in one reply as several tool calls: they run together. Use record_finding to state a conclusion and the evidence for it before you propose any change.
 - Prefer the narrowest, most reversible change that fixes the cause: reload over restart, rollout undo over delete, scale over edit, plan before apply. Put the rollback in expected_effect. One command per tool call. Do not chain commands with && or ;, and do not use pipes into a shell, command substitution $(...) or backticks -- commands that cannot be read statically are treated as high risk and will be held for approval. For several steps on one machine, use run_script when it is available: the approver sees the whole script, and it runs on its own only when every line is read-only.
 - Actions are classified by risk. This project's autonomy policy (stated in the first message) decides which run on their own; the rest pause for a human, who reads your intent, expected_effect and the exact command. Write those fields for that person. High-risk actions always wait for a human.
 - Do not fan out across hosts. When several machines could be relevant, work out the single one the task points to (match a hostname or service in the task to a machine's name) and confirm it with the operator before running anything -- running a read-only check on every host is noise, not diagnosis.
@@ -96,7 +96,7 @@ You can use net_check, which runs read-only checks from the SupOps server: http 
 
 /** Appended after ADVISORY_PROMPT when the project has observability connections. */
 export const ADVISORY_OBSERVABILITY_PROMPT = `METRICS, LOGS AND ALERTS
-Although you cannot reach any host, you can read this project's observability connections (listed in the first message) with query_metrics, query_logs and alerts. They are read-only APIs.
+Although you cannot reach any host, you can read this project's observability connections (listed in the first message) with query_metrics, query_logs, query_traces and alerts. They are read-only APIs.
 - Look there first: firing alerts, the relevant metrics around the time of the problem, and error logs. Cite what you observed (the query and the numbers) instead of guessing.
 - Use what they show to narrow the likely causes before handing the operator commands, and give the operator commands only for what the metrics and logs cannot answer.`;
 
@@ -108,7 +108,9 @@ Although you cannot reach any host, you can read this project's observability co
 export const INCIDENT_PROMPT = `INCIDENT INVESTIGATION
 The first message lists the incident's alerts and an EVIDENCE PACK: results of fixed read-only checks run against this project's metrics and logs when the incident opened, numbered [E1], [E2]...
 - Start from the evidence: what is interesting there, and what it rules out. Then test the most likely explanation with the narrowest read-only check (query_metrics with baseline or forecast, query_logs, a command on the machine).
-- Work like an SRE: list the plausible causes, and for each say whether the evidence supports it, refutes it, or it is still untested. Look for what changed just before it started (a deploy, a config change, a traffic jump, a disk filling).
+- Work like an SRE: list the plausible causes, and for each say whether the evidence confirms it, rules it out, or it is still untested. Look for what changed just before it started (a deploy, a config change, a traffic jump, a disk filling). When the first message lists RECENT CHANGES ([C1], [C2]...), test the likeliest first and cite them like evidence; a change is a suspect until the evidence ties it to what failed.
+- A symptom is never the root cause. High CPU, errors, slow responses, a full disk or queue, or the alert itself say what is wrong, not why. Name what made it happen (a change, a resource being used up and by what, a failing dependency, bad input) and the chain from it to what fired. If you cannot get past the symptom, the answer is Inconclusive, with what is missing.
+- When several components are unhealthy, the cause is usually the furthest upstream one (see the service map when given); the others are its effects.
 - Cite evidence for every claim: [E3] for the evidence pack, or the tool call you ran ("query_metrics on prometheus-main showed ..."). Never cite an [E..] number that is not in the list. If the evidence is not enough, say so: "Inconclusive" is a valid answer and better than a guess.
 - End with this report (Markdown):
   **Action:** act now | can wait | none needed
@@ -116,9 +118,13 @@ The first message lists the incident's alerts and an EVIDENCE PACK: results of f
   **Confidence:** high | medium | low
   Choose the action honestly: "none needed" when it is not a real problem (for example a stable value that merely crossed a fixed line), and say why in the root cause. Write for a busy operator: no jargon such as "false positive", no restating the alert.
   ### Evidence
-  The hypotheses as a table: hypothesis | verdict (supported / refuted / untested) | evidence.
+  The hypotheses as a table: hypothesis | verdict (confirmed / ruled out / untested) | evidence.
   ### Impact
   What is affected and since when.
+  ### Blast radius
+  - **Affected:** what is affected, with the evidence
+  - **Checked healthy:** what you checked and found fine
+  - **Not checked:** what could be affected that you did not look at
   ### Suggested actions
   The fix, narrowest first, then how to verify it and roll it back, in a \`\`\`bash block, one command per line with a # comment. Mark commands that change state. Do not run changes in this investigation unless the operator asks.`;
 
@@ -134,14 +140,23 @@ The first message lists the incident's alerts, an EVIDENCE PACK numbered [E1], [
 - Cite evidence as [E3] or by the tool call you ran. Never cite an [E..] number that is not in the list.
 - End with: what was wrong, what you changed, what you observed afterwards, and anything a person should still look at.`;
 
+/** The built-in triage agent's own instructions (also what the accuracy eval runs with). */
+export const TRIAGE_AGENT_PROMPT =
+  'You are triaging an incident. Work the problem from evidence: check service ' +
+  'status, recent logs, resource pressure and recent changes before forming a ' +
+  'hypothesis. State your conclusion with record_finding before proposing any ' +
+  'change. Prefer the smallest reversible action that addresses the cause.';
+
 export function buildSystemPrompt(
   projectExtra: string | null,
   agentPrompt: string,
+  playbooks = '',
   opts: { advisory?: boolean; networkChecks?: boolean; observability?: boolean; incident?: boolean | 'diagnose' | 'fix'; call?: boolean } = {},
 ): string {
   return [
     CORE_SYSTEM_PROMPT,
     agentPrompt,
+    playbooks,
     projectExtra,
     opts.advisory ? ADVISORY_PROMPT : null,
     opts.advisory && opts.call ? CALL_PROMPT : null,
@@ -179,14 +194,16 @@ export function buildOpeningMessage(params: {
   observations?: string;
   /** How the in-scope systems connect (the service map). */
   serviceMap?: string;
+  /** Which data sources the run can read, and which are missing or failing (see coverageBlock). */
+  dataSources?: string;
 }): string {
-  const extra = `${params.evidence ? `\n\n${params.evidence}` : ''}${params.serviceMap ? `\n\n${params.serviceMap}` : ''}${params.observations ? `\n\n${params.observations}` : ''}`;
+  const extra = `${params.evidence ? `\n\n${params.evidence}` : ''}${params.serviceMap ? `\n\n${params.serviceMap}` : ''}${params.observations ? `\n\n${params.observations}` : ''}${params.dataSources ? `\n\n${params.dataSources}` : ''}`;
   if (params.advisory) {
     const knowledge = params.knowledge
       ? `\n\n${params.knowledge}`
       : '\n\nNo project knowledge (runbooks, facts) matched this task: answer from your own expertise, marked as general knowledge, and say which facts about this environment you would need.';
     const observability = params.targets.length
-      ? `\n\nObservability connections you can read (query_metrics, query_logs, alerts):\n${params.targets
+      ? `\n\nObservability connections you can read (query_metrics, query_logs, query_traces, alerts):\n${params.targets
           .map((t) => `- ${t.slug} (${t.kind}, env=${t.env})${t.description ? `: ${t.description}` : ''}`)
           .join('\n')}`
       : '';
@@ -218,7 +235,8 @@ ${params.task}`;
         `  IMPORTANT: do NOT check these machines one by one. From the task, deduce the SINGLE ` +
         `machine it refers to by matching a hostname or service in the task to a machine name ` +
         `(e.g. "logstore disk usage" -> the machine named "logstore1"), then call confirm_target ` +
-        `with that machine and a one-line plan. It pauses for the operator to Approve or Reject. ` +
+        `with that machine, a one-line plan, and the steps you will take (one per part of the task, ` +
+        `so the operator sees the plan up front). It pauses for the operator to Approve or Reject. ` +
         `Run NOTHING on any machine until confirm_target is approved; if it is rejected, read the ` +
         `note and confirm a different machine. If the task is about a jump host itself (its name or ` +
         `address matches one listed above), work on that jump target directly.`,
@@ -249,10 +267,10 @@ ${params.task}`;
     : '';
 
   // Observability connections are not machines: say how to use them, and to look there first.
-  const observability = params.targets.some((t) => ['prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana'].includes(t.kind))
-    ? '\n\nObservability connections (kinds prometheus, grafana, alertmanager, loki, elasticsearch) are read-only APIs: ' +
-      'use query_metrics, query_logs and alerts on them. When a symptom is reported, check firing alerts and the ' +
-      'relevant metrics or logs there before logging into machines.'
+  const observability = params.targets.some((t) => ['prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana', 'tempo', 'jaeger', 'signoz'].includes(t.kind))
+    ? '\n\nObservability connections (kinds prometheus, grafana, alertmanager, loki, elasticsearch, tempo, jaeger, signoz) are read-only APIs: ' +
+      'use query_metrics, query_logs, query_traces and alerts on them. When a symptom is reported, check firing alerts and the ' +
+      'relevant metrics, logs or traces there before logging into machines.'
     : '';
   const autonomy = params.autonomy ? `\n\nAutonomy: ${params.autonomy}` : '';
   const knowledge = params.knowledge ? `\n\n${params.knowledge}` : '';

@@ -18,7 +18,7 @@ export function bindTool(
   def: ToolDef<never>,
   targets: ResolvedTarget[],
 ): ResolvedTool | null {
-  const eligible = targets.filter((t) => def.targetKinds.includes(t.kind));
+  const eligible = def.fixedTarget ? [def.fixedTarget] : targets.filter((t) => def.targetKinds.includes(t.kind));
   // A tool with no target to act on is noise in the prompt, and every extra tool
   // measurably degrades tool-call accuracy on smaller models. Drop it.
   if (eligible.length === 0) return null;
@@ -74,7 +74,7 @@ export function bindTools(
  * on machines (ssh_exec) may also run kubectl on clusters. One definition, used both
  * when a run starts and when it is resumed, so the two can never disagree.
  */
-const IMPLIED_TOOLS: Record<string, string[]> = { ssh_exec: ['k8s_kubectl', 'query_metrics', 'query_logs', 'alerts'] };
+const IMPLIED_TOOLS: Record<string, string[]> = { ssh_exec: ['run_script', 'docker', 'k8s_kubectl', 'query_metrics', 'query_logs', 'query_traces', 'alerts', 'scm'], query_logs: ['query_traces'] };
 
 export function effectiveToolKeys(keys: string[] | null): string[] | null {
   if (keys === null) return null;
@@ -85,6 +85,13 @@ export function effectiveToolKeys(keys: string[] | null): string[] | null {
 
 export class ToolRegistry {
   private byKey = new Map<string, ToolDef<never>>();
+  /**
+   * Tools that come and go at runtime, in named groups (an MCP server's tools). Found
+   * by `get` -- so a run started with one can resume -- but never part of `resolve` or
+   * `keys`: an agent allowed "every tool" must not pick up another project's server.
+   */
+  private dynamic = new Map<string, ToolDef<never>>();
+  private groups = new Map<string, string[]>();
 
   register(def: ToolDef<never>): this {
     if (this.byKey.has(def.key)) throw new Error(`Duplicate tool key "${def.key}"`);
@@ -101,7 +108,25 @@ export class ToolRegistry {
   }
 
   get(key: string): ToolDef<never> | undefined {
-    return this.byKey.get(key);
+    return this.byKey.get(key) ?? this.dynamic.get(key);
+  }
+
+  /** Replace a group of runtime tools (empty removes it). A key clash with a built-in is skipped. */
+  setGroup(group: string, defs: ToolDef<never>[]): void {
+    for (const k of this.groups.get(group) ?? []) this.dynamic.delete(k);
+    const keys: string[] = [];
+    for (const d of defs) {
+      if (this.byKey.has(d.key) || this.dynamic.has(d.key)) continue;
+      if (d.kind !== 'internal' && !d.classifyArgs) throw new Error(`Tool "${d.key}" touches a system but has no argument classifier (classifyArgs)`);
+      this.dynamic.set(d.key, d);
+      keys.push(d.key);
+    }
+    if (keys.length) this.groups.set(group, keys);
+    else this.groups.delete(group);
+  }
+
+  group(group: string): ToolDef<never>[] {
+    return (this.groups.get(group) ?? []).map((k) => this.dynamic.get(k)!).filter(Boolean);
   }
 
   /**

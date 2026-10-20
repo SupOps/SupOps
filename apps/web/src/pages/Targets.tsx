@@ -13,7 +13,10 @@ import { HEALTH_STYLE, targetAddress } from '../lib/format';
 import { DiscoverVms } from '../components/DiscoverVms';
 import { ClusterForm } from '../components/ClusterForm';
 import { ConnectionForm } from '../components/ConnectionForm';
-import { isObservabilityKind } from '@supops/shared';
+import { isObservabilityKind as isObs, isScmKind } from '@supops/shared';
+
+/** Connections reached over an API (observability, source control), edited with ConnectionForm. */
+const isObservabilityKind = (k: string) => isObs(k) || isScmKind(k);
 import type { Target } from '../lib/types';
 
 export function Targets() {
@@ -150,7 +153,7 @@ export function Targets() {
              they are all the same width and flow left-to-right, wrapping as they fill.
              items-start (not stretch) so expanding one card's machines grows only that
              card, rather than stretching its neighbours to match. */
-          <div className="grid items-start gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]">
+          <div className="grid items-start gap-4 [grid-template-columns:repeat(auto-fill,minmax(min(340px,100%),1fr))]">
         {[...viaByHost.entries()].map(([host, vms]) => {
           const jump = jumpByHost.get(host);
           const open = openHosts.has(host);

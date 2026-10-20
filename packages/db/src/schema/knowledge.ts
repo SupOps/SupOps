@@ -36,6 +36,11 @@ export const knowledgeDocs = sqliteTable(
     scope: text('scope', { mode: 'json' }).$type<KnowledgeScope>().notNull().default({}),
     /** Pinned documents are always included in matching runs (facts default to pinned). */
     pinned: integer('pinned', { mode: 'boolean' }).notNull().default(false),
+    /**
+     * Runbooks only: the alerts it is for, as alert names ("DiskFull, Disk*") or
+     * Alertmanager matchers. A run on a matching incident is given it to follow.
+     */
+    alertMatch: text('alert_match'),
     status: text('status').$type<KnowledgeStatus>().notNull().default('draft'),
     sourceRunId: text('source_run_id').references(() => runs.id, { onDelete: 'set null' }),
     /** Where an imported document came from, e.g. "ops-handbook.pdf, p. 4–7". */
@@ -65,8 +70,8 @@ export const runKnowledge = sqliteTable(
     docId: text('doc_id')
       .notNull()
       .references(() => knowledgeDocs.id, { onDelete: 'cascade' }),
-    /** pinned/matched/runbook: given at the start. read: the agent chose to read it (read_knowledge). */
-    via: text('via').$type<'pinned' | 'matched' | 'runbook' | 'read'>().notNull(),
+    /** pinned/matched/runbook/alert (for the incident's alerts): given at the start. read: the agent chose to read it (read_knowledge). */
+    via: text('via').$type<'pinned' | 'matched' | 'runbook' | 'alert' | 'read'>().notNull(),
     createdAt: createdAt(),
   },
   (t) => [index('run_knowledge_run').on(t.runId), index('run_knowledge_doc').on(t.docId)],

@@ -194,6 +194,13 @@ function AgentEditor({
   const reset = useMutation({ mutationFn: () => post(`/agents/${agent!.id}/reset`, {}), onSuccess: done, onError: fail });
   const remove = useMutation({ mutationFn: () => del(`/agents/${agent!.id}`), onSuccess: done, onError: fail });
 
+  // MCP servers' tools are given per server (mcp_<name>_*); each call still waits for
+  // approval unless an admin marked that tool read-only.
+  const mcp = useQuery({
+    queryKey: ['mcpServers', projectId],
+    queryFn: () => api<{ servers: Array<{ id: string; name: string; wildcard: string; enabled: boolean; tools: unknown[] }> }>(`/mcp-servers?projectId=${projectId}`),
+    enabled: !!projectId && !locked,
+  });
   const toggleTool = (k: string) =>
     setForm((f) => ({ ...f, toolKeys: f.toolKeys.includes(k) ? f.toolKeys.filter((x) => x !== k) : [...f.toolKeys, k] }));
   const setBudget = (k: keyof AgentBudget, v: number) => setForm((f) => ({ ...f, budget: { ...f.budget, [k]: v } }));
@@ -256,6 +263,17 @@ function AgentEditor({
                       <input type="checkbox" checked={form.toolKeys.includes(t.key)} onChange={() => toggleTool(t.key)} />
                       <code className="font-mono text-ink">{t.key}</code>
                       <span className="ml-auto"><RiskBadge tier={t.baselineRisk} /></span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              {!form.allTools && !!mcp.data?.servers.length && (
+                <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+                  {mcp.data.servers.map((m) => (
+                    <label key={m.id} className={clsx('flex items-center gap-2 rounded-inner border border-hairline px-2.5 py-1.5 text-xs', !m.enabled && 'opacity-60')}>
+                      <input type="checkbox" checked={form.toolKeys.includes(m.wildcard)} onChange={() => toggleTool(m.wildcard)} />
+                      <code className="min-w-0 truncate font-mono text-ink">{m.wildcard}</code>
+                      <span className="ml-auto shrink-0 text-[10.5px] text-muted">MCP · {m.tools.length} tools</span>
                     </label>
                   ))}
                 </div>

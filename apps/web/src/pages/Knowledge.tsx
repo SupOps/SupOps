@@ -26,6 +26,8 @@ export interface KnowledgeDoc {
   tags: string[];
   scope: { targetIds?: string[]; kinds?: string[]; envs?: string[] };
   pinned: boolean;
+  /** Runbooks: the alerts it is for (names or Alertmanager matchers). */
+  alertMatch?: string | null;
   status: Status;
   /** Where an imported document came from, e.g. "ops-handbook.pdf, p. 4–7". */
   source?: string | null;
@@ -195,14 +197,14 @@ function DocEditor({ id, projectId, isAdmin, onClose }: { id: string | null; pro
   const qc = useQueryClient();
   const doc = useQuery({ queryKey: ['knowledge-doc', id], queryFn: () => api<KnowledgeDoc>(`/knowledge/${id}`), enabled: !!id });
   const targets = useQuery({ queryKey: ['targets', projectId], queryFn: () => api<Target[]>(`/targets?projectId=${projectId}`) });
-  const [form, setForm] = useState({ slug: '', kind: 'note' as Kind, title: '', body: '', tags: '', pinned: false, envs: [] as string[], targetIds: [] as string[] });
+  const [form, setForm] = useState({ slug: '', kind: 'note' as Kind, title: '', body: '', tags: '', pinned: false, alertMatch: '', envs: [] as string[], targetIds: [] as string[] });
   const [editing, setEditing] = useState(!id);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const d = doc.data;
     if (!d) return;
-    setForm({ slug: d.slug, kind: d.kind, title: d.title, body: d.body, tags: d.tags.join(', '), pinned: d.pinned, envs: d.scope.envs ?? [], targetIds: d.scope.targetIds ?? [] });
+    setForm({ slug: d.slug, kind: d.kind, title: d.title, body: d.body, tags: d.tags.join(', '), pinned: d.pinned, alertMatch: d.alertMatch ?? '', envs: d.scope.envs ?? [], targetIds: d.scope.targetIds ?? [] });
   }, [doc.data]);
 
   const refresh = () => {
@@ -217,6 +219,7 @@ function DocEditor({ id, projectId, isAdmin, onClose }: { id: string | null; pro
     body: form.body,
     tags: form.tags.split(',').map((t) => t.trim()).filter(Boolean),
     pinned: form.pinned,
+    ...(form.kind === 'runbook' ? { alertMatch: form.alertMatch.trim() || null } : {}),
     scope: { ...(form.envs.length ? { envs: form.envs } : {}), ...(form.targetIds.length ? { targetIds: form.targetIds } : {}) },
   });
   const save = useMutation({
@@ -269,6 +272,16 @@ function DocEditor({ id, projectId, isAdmin, onClose }: { id: string | null; pro
               <textarea className="input min-h-56 resize-y font-mono text-xs leading-relaxed" value={form.body} onChange={(e) => setForm({ ...form, body: e.target.value })}
                 placeholder={form.kind === 'fact' ? 'e.g. db-1 is the PostgreSQL primary; db-2 is the streaming replica.' : form.kind === 'runbook' ? '1. Check disk with df -h\n2. …' : 'How this part of the system is set up…'} />
             </label>
+            {form.kind === 'runbook' && (
+              <label className="block">
+                <span className="label">For these alerts (optional)</span>
+                <input className="input font-mono text-xs" value={form.alertMatch} onChange={(e) => setForm({ ...form, alertMatch: e.target.value })}
+                  placeholder={'DiskFilling, HighMemory*   or   alertname=~"Disk.*", env="prod"'} />
+                <span className="mt-1 block text-[11px] text-muted">
+                  Alert names (* matches anything) or matchers. An incident with a matching alert is diagnosed by following this runbook, and the answer says which steps were followed.
+                </span>
+              </label>
+            )}
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="block"><span className="label">Tags (comma-separated)</span>
                 <input className="input" value={form.tags} onChange={(e) => setForm({ ...form, tags: e.target.value })} />
@@ -312,6 +325,7 @@ function DocEditor({ id, projectId, isAdmin, onClose }: { id: string | null; pro
                 <span className="chip border border-edge bg-tile-2">{KIND_LABEL[d.kind]}</span>
                 <span className="font-mono">{d.slug}</span>
                 {d.pinned && <span>· pinned</span>}
+                {d.kind === 'runbook' && d.alertMatch && <span className="min-w-0 break-all">· for alerts <span className="font-mono text-ink/80">{d.alertMatch}</span></span>}
                 {d.scope.envs?.length ? <span>· {d.scope.envs.join(', ')} only</span> : null}
                 {d.scope.targetIds?.length ? <span>· {d.scope.targetIds.length} target{d.scope.targetIds.length === 1 ? '' : 's'}</span> : null}
                 {d.tags.map((t) => <span key={t} className="chip border border-edge bg-tile-2">{t}</span>)}

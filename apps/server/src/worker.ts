@@ -1,4 +1,5 @@
-import { engine, settingsStore } from './context.ts';
+import { reflectOnRun } from '@supops/core';
+import { db, engine, llm, settingsStore } from './context.ts';
 
 /**
  * The scheduler.
@@ -61,8 +62,20 @@ export class Worker {
       this.running.add(run.id);
       void engine
         .runToCompletion(run.id)
+        .then(() => this.reflect(run.id))
         .catch((err) => console.error(`run ${run.id} crashed:`, err))
         .finally(() => this.running.delete(run.id));
+    }
+  }
+
+  /** After a run ends: what did it teach? A model proposes, the lesson gate decides. Never fails the run. */
+  private async reflect(runId: string): Promise<void> {
+    const cfg = settingsStore.learning();
+    if (cfg.reflect === 'off') return;
+    try {
+      await reflectOnRun(db, llm, runId, { mode: cfg.reflect, minActions: cfg.reflectMinActions });
+    } catch (err) {
+      console.warn(`learning: could not reflect on run ${runId}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }

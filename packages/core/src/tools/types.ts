@@ -37,9 +37,16 @@ export interface KnowledgeAccess {
   read(slug: string): { slug: string; title: string; kind: string; body: string; source: string | null } | null;
 }
 
+/** A run's own earlier tool results, in full (see tools/read-output.ts). */
+export interface OutputAccess {
+  read(toolCallId: string): { toolKey: string; rendered: string; text: string } | null;
+}
+
 export interface ExecContext {
   /** Only for knowledge tools; absent elsewhere. */
   knowledge?: KnowledgeAccess;
+  /** Only for read_output; absent elsewhere. */
+  outputs?: OutputAccess;
   runId: string;
   toolCallId: string;
   target: ResolvedTarget;
@@ -79,6 +86,11 @@ export interface ToolDef<TArgs = Record<string, unknown>> {
   /** Floor, never a ceiling. Argument rules and target sensitivity can only raise it. */
   baselineRisk: RiskTier;
   targetKinds: TargetKind[];
+  /**
+   * Acts only on this one target, never on the project's (MCP tools: the call is made
+   * from the SupOps server). Overrides targetKinds when binding.
+   */
+  fixedTarget?: ResolvedTarget;
   /** Mutating tools must declare intent/expected_effect and get a verification probe. */
   mutating: boolean;
   timeoutMs: number;

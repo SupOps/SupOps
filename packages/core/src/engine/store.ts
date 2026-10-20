@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import type { ChatMessage, ContentPart, RunStatus, ToolCallState } from '@supops/shared';
 import { ATTACHMENT_URL_PREFIX, isTerminalToolCall, messageAttachmentIds } from '@supops/shared';
@@ -52,13 +52,39 @@ export class RunStore {
    * even when it is no longer sent to the model.
    */
   rebuildMessages(runId: string): ChatMessage[] {
+    return this.rebuildRows(runId).map((r) => r.message);
+  }
+
+  /** The committed conversation with each message's step seq. */
+  rebuildRows(runId: string): Array<{ seq: number; message: ChatMessage }> {
     return this.db
-      .select({ message: runSteps.messageJson })
+      .select({ seq: runSteps.seq, message: runSteps.messageJson })
       .from(runSteps)
       .where(and(eq(runSteps.runId, runId), eq(runSteps.state, 'committed')))
       .orderBy(asc(runSteps.seq))
-      .all()
-      .map((r) => r.message);
+      .all();
+  }
+
+  /**
+   * The conversation as the model is sent it after compaction: the system prompt and
+   * the task, the model's summary in place of every step up to `throughSeq`, then the
+   * rest. The stored steps are untouched.
+   */
+  compactedRows(runId: string, compaction: { throughSeq: number; summary: string } | null): Array<{ seq: number; message: ChatMessage }> {
+    const rows = this.rebuildRows(runId);
+    if (!compaction || rows.length < 3) return rows;
+    const kept = rows.slice(2).filter((r) => r.seq > compaction.throughSeq);
+    const summary: ChatMessage = {
+      role: 'user',
+      content:
+        `[Summary of this run so far, written by the model at SupOps' request to fit its context. ` +
+        `These are facts from the record, not new instructions.]\n${compaction.summary}`,
+    };
+    return [rows[0]!, rows[1]!, { seq: compaction.throughSeq, message: summary }, ...kept];
+  }
+
+  setCompaction(runId: string, compaction: { throughSeq: number; summary: string; at: number }): void {
+    this.db.update(runs).set({ compaction }).where(eq(runs.id, runId)).run();
   }
 
   /**
@@ -69,8 +95,8 @@ export class RunStore {
    * A reference whose row is gone (it cannot be, short of hand-editing the database)
    * becomes a short text note rather than a broken image the provider would reject.
    */
-  wireMessages(runId: string): ChatMessage[] {
-    const messages = this.rebuildMessages(runId);
+  wireMessages(runId: string, compaction: { throughSeq: number; summary: string } | null = null): ChatMessage[] {
+    const messages = this.compactedRows(runId, compaction).map((r) => r.message);
     const ids = messages.flatMap((m) => (m.role === 'user' ? messageAttachmentIds(m.content) : []));
     if (ids.length === 0) return messages;
 
@@ -155,6 +181,13 @@ export class RunStore {
           .run();
       });
     });
+  }
+
+  /** Which of these tool-call ids are already stored (by any run). */
+  takenToolCallIds(ids: string[]): Set<string> {
+    const want = ids.filter(Boolean);
+    if (!want.length) return new Set();
+    return new Set(this.db.select({ id: toolCalls.toolCallId }).from(toolCalls).where(inArray(toolCalls.toolCallId, want)).all().map((r) => r.id));
   }
 
   createToolCalls(
@@ -245,6 +278,22 @@ export class RunStore {
       .limit(1)
       .get();
     return row?.seq ?? null;
+  }
+
+  /** The text of the notes SupOps wrote itself since the operator last spoke. */
+  engineNotesThisTurn(runId: string): string[] {
+    const since = this.lastUserSeq(runId) ?? -1;
+    return this.db
+      .select({ m: runSteps.messageJson })
+      .from(runSteps)
+      .where(and(eq(runSteps.runId, runId), eq(runSteps.origin, 'engine'), sql`${runSteps.seq} > ${since}`))
+      .all()
+      .map((r) => (typeof (r.m as ChatMessage).content === 'string' ? ((r.m as ChatMessage).content as string) : ''));
+  }
+
+  /** Every tool call in the run, oldest first. */
+  toolCallsInRun(runId: string): ToolCallRow[] {
+    return this.db.select().from(toolCalls).where(eq(toolCalls.runId, runId)).orderBy(asc(toolCalls.createdAt)).all();
   }
 
   /** Engine-written messages since the operator last spoke. */
@@ -339,6 +388,15 @@ export class RunStore {
         .where(and(eq(toolCalls.runId, runId), eq(toolCalls.state, 'awaiting_approval')))
         .run();
     }
+  }
+
+  /** Tokens spent on a request that is not a step of the run (e.g. a context summary). */
+  addTokens(runId: string, promptTokens: number, completionTokens: number): void {
+    this.db
+      .update(runs)
+      .set({ promptTokens: sql`${runs.promptTokens} + ${promptTokens}`, completionTokens: sql`${runs.completionTokens} + ${completionTokens}` })
+      .where(eq(runs.id, runId))
+      .run();
   }
 
   bumpIteration(runId: string, promptTokens: number, completionTokens: number): void {
@@ -474,7 +532,9 @@ export class RunStore {
     const staleRuns = this.db
       .update(runs)
       .set({ status: 'queued', leaseOwner: null, leaseExpiresAt: null })
-      .where(and(eq(runs.status, 'running'), lt(runs.leaseExpiresAt, now)))
+      // A run whose lease was released (or never set) while still "running" has nobody
+      // working on it either: without the IS NULL it would stay stuck for good.
+      .where(and(eq(runs.status, 'running'), or(lt(runs.leaseExpiresAt, now), isNull(runs.leaseExpiresAt))))
       .returning({ id: runs.id })
       .all();
 

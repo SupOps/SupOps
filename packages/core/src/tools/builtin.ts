@@ -1,5 +1,11 @@
 import { z } from 'zod';
 import { readKnowledgeTool, searchKnowledgeTool } from './knowledge.ts';
+import { readOutputTool } from './read-output.ts';
+import { planTool } from './plan.ts';
+import { queryTracesTool } from './traces.ts';
+import { dockerTool } from './docker.ts';
+import { runScriptTool } from './script.ts';
+import { scmTool } from './scm.ts';
 import { TARGET_KINDS } from '@supops/shared';
 import { alertsTool, queryLogsTool, queryMetricsTool } from './observability.ts';
 import type { RiskContribution } from '@supops/shared';
@@ -153,6 +159,10 @@ export const recordFindingTool: ToolDef<z.infer<typeof recordFindingArgs>> = {
 const confirmTargetArgs = z.object({
   target: z.string(),
   plan: z.string().min(1).max(500),
+  // The short to-do list for this run, shown live in the plan panel the moment the
+  // target is confirmed -- so a multi-part task has a visible plan from the start,
+  // even before the agent calls update_plan. Optional and back-compatible.
+  steps: z.array(z.string().min(1).max(200)).max(12).optional(),
 });
 
 /**
@@ -170,13 +180,20 @@ export const confirmTargetTool: ToolDef<z.infer<typeof confirmTargetArgs>> = {
   description:
     'Confirm which machine to work on BEFORE running anything, when the task could ' +
     'concern one of several machines (e.g. behind a jump). Deduce the single machine, ' +
-    'call this with it and a one-line plan; it pauses for the operator to Approve or ' +
-    'Reject. Run no command on the machine until this is approved. If rejected, read ' +
-    'the note and choose again.',
+    'call this with it, a one-line plan, and `steps`: the short to-do list you will work ' +
+    'through (one entry per part of the task -- e.g. ["Check pod health", "List deployments", ' +
+    '"Find unused images"]). It pauses for the operator to Approve or Reject, and the steps ' +
+    'show in the plan panel immediately. Run no command on the machine until this is approved. ' +
+    'If rejected, read the note and choose again.',
   parameters: {
     plan: {
       type: 'string',
       description: 'One line: what you will do on this machine, and why it is the right one.',
+    },
+    steps: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'The to-do list for this task, one short entry per step, in order (at most 12).',
     },
   },
   required: ['plan'],
@@ -320,30 +337,40 @@ export function createDefaultRegistry(): ToolRegistry {
   return new ToolRegistry()
     .register(sshExecTool as unknown as ToolDef<never>)
     .register(sshReadFileTool as unknown as ToolDef<never>)
+    .register(runScriptTool as unknown as ToolDef<never>)
     .register(sshWriteFileTool as unknown as ToolDef<never>)
     .register(recordFindingTool as unknown as ToolDef<never>)
     .register(confirmTargetTool as unknown as ToolDef<never>)
     .register(kubectlTool as unknown as ToolDef<never>)
     .register(queryMetricsTool as unknown as ToolDef<never>)
     .register(queryLogsTool as unknown as ToolDef<never>)
+    .register(queryTracesTool as unknown as ToolDef<never>)
+    .register(dockerTool as unknown as ToolDef<never>)
+    .register(scmTool as unknown as ToolDef<never>)
     .register(alertsTool as unknown as ToolDef<never>)
     .register(searchKnowledgeTool as unknown as ToolDef<never>)
-    .register(readKnowledgeTool as unknown as ToolDef<never>);
+    .register(readKnowledgeTool as unknown as ToolDef<never>)
+    .register(readOutputTool as unknown as ToolDef<never>)
+    .register(planTool as unknown as ToolDef<never>);
 }
+
+/** SupOps' own tools about the run itself, given to every run whatever the agent's tool list. */
+export const SESSION_TOOL_KEYS = ['read_output', 'update_plan'];
 
 /** Given to every run whose project has approved knowledge, whatever the agent's tool list. */
 export const KNOWLEDGE_TOOL_KEYS = ['search_knowledge', 'read_knowledge'];
 
-/** Read-only API tools for observability connections; advisory runs get these too. */
-export const OBSERVABILITY_TOOL_KEYS = ['query_metrics', 'query_logs', 'alerts'];
+/** Read-only API tools for observability and source-control connections; advisory runs get these too. */
+export const OBSERVABILITY_TOOL_KEYS = ['query_metrics', 'query_logs', 'query_traces', 'alerts', 'scm'];
 
-export const BUILTIN_TOOL_KEYS = ['ssh_exec', 'ssh_read_file', 'k8s_kubectl', 'query_metrics', 'query_logs', 'alerts', 'record_finding', 'confirm_target'];
+export const BUILTIN_TOOL_KEYS = ['ssh_exec', 'ssh_read_file', 'run_script', 'docker', 'k8s_kubectl', 'query_metrics', 'query_logs', 'query_traces', 'alerts', 'scm', 'record_finding', 'confirm_target'];
 
 /** The Console agent can also create files. */
 export const CONSOLE_TOOL_KEYS = [
   'ssh_exec',
   'ssh_read_file',
   'ssh_write_file',
+  'run_script',
   'k8s_kubectl',
   'record_finding',
   'confirm_target',

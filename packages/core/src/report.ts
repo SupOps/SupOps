@@ -72,7 +72,7 @@ export function recordedFindings(toolCalls: ReportToolCall[]): RecordedFinding[]
  */
 export function essentialEvidence(input: ReportInput): ReportToolCall[] {
   const executed = input.toolCalls.filter(
-    (c) => c.toolKey !== 'record_finding' && c.resultJson && (c.state === 'succeeded' || c.state === 'failed'),
+    (c) => c.toolKey !== 'record_finding' && c.toolKey !== 'update_plan' && c.resultJson && (c.state === 'succeeded' || c.state === 'failed'),
   );
   if (input.kind === 'health') return executed.slice(0, 16);
   const notable = executed.filter((c) => (c.tier && c.tier !== 'read_only') || c.isError || c.decidedBy);
@@ -353,7 +353,7 @@ export function buildShareableMarkdown(input: ReportInput, aiBody: string | null
   // the record is not empty.
   const notable = toolCalls.filter((c) => (c.tier && c.tier !== 'read_only') || c.isError || c.decidedBy);
   const ran = toolCalls.filter(
-    (c) => c.toolKey !== 'record_finding' && (c.state === 'succeeded' || c.state === 'failed'),
+    (c) => c.toolKey !== 'record_finding' && c.toolKey !== 'update_plan' && (c.state === 'succeeded' || c.state === 'failed'),
   );
   const record = (notable.length ? notable : ran).slice(0, 30);
   if (record.length) {

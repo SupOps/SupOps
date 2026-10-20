@@ -18,6 +18,7 @@ import { FeedbackBar } from '../components/FeedbackBar';
 import { useImageAttachments } from '../lib/images';
 import { useDictation } from '../lib/useDictation';
 import { MicButton } from '../components/MicButton';
+import { PLAN_TOOL, PlanLine } from '../components/RunPlan';
 
 const SESSION_KEY = 'supops.consoleRun';
 const BUSY = ['queued', 'running', 'awaiting_approval'];
@@ -173,7 +174,7 @@ export function Console() {
   const terminalLines = useMemo<TerminalLine[]>(() => {
     const out: TerminalLine[] = [];
     for (const c of detail.data?.toolCalls ?? []) {
-      if (c.toolKey === 'record_finding') continue;
+      if (c.toolKey === 'record_finding' || c.toolKey === PLAN_TOOL) continue;
       out.push({
         kind: 'command',
         text: c.renderedCommand ?? c.toolKey,
@@ -271,7 +272,8 @@ export function Console() {
                   )}
                   {m.tool_calls?.map((tc) => {
                     const call = detail.data?.toolCalls.find((c) => c.toolCallId === tc.id);
-                    return call ? <ActionCard key={tc.id} call={call} /> : null;
+                    if (!call) return null;
+                    return call.toolKey === PLAN_TOOL && call.state === 'succeeded' ? <PlanLine key={tc.id} call={call} /> : <ActionCard key={tc.id} call={call} />;
                   })}
                 </div>
               );

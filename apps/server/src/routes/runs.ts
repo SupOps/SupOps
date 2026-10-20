@@ -32,6 +32,7 @@ import {
   canDecide,
   mergePolicy,
   globalRolesMeeting,
+  harvest,
   matchesRule,
   rateSuggestedCommand,
   requiredRole,
@@ -50,6 +51,7 @@ import { startRun } from '../services/start-run.ts';
 import { decodeImages, imagesInput, saveImages, userContent } from '../services/attachments.ts';
 import { runHistoryCleanup } from '../services/retention.ts';
 import { isAdmin } from '../auth.ts';
+import { audit } from '../services/audit.ts';
 
 export const runRoutes = Router();
 
@@ -523,6 +525,12 @@ runRoutes.post('/tool-calls/:id/decision', (req, res) => {
     // Only possible on an install with one eligible approver; recorded so it shows.
     ...(check.selfApproved ? { selfApproved: true } : {}),
   });
+
+  // A denial is a lesson: the same action denied again needs more approval, or is blocked.
+  if (!approved && call.signature) {
+    const learned = harvest(db, run.projectId, call.signature);
+    for (const l of learned) audit(req.user, { projectId: run.projectId, entity: 'learned_rule', entityId: l.ruleId, action: l.created ? 'learn' : 'strengthen', after: { effect: l.effect, minTier: l.minTier } });
+  }
 
   worker.nudge();
   res.json({ ok: true, state: approved ? 'approved' : 'denied' });

@@ -11,8 +11,8 @@ import {
   targets,
   toolCalls,
 } from '@supops/db';
-import { applyMethodScript, diagnoseSecret, kubeCredentialFromInput, kubectlPing, parseHostAddresses, pinHostKey, safeGet, shellQuote, loadTarget, resolveBecomeSecrets, resolveSecret, sshExec } from '@supops/core';
-import { OBSERVABILITY_KINDS, isObservabilityKind } from '@supops/shared';
+import { applyMethodScript, diagnoseSecret, kubeCredentialFromInput, kubectlPing, parseHostAddresses, pinHostKey, safeGet, shellQuote, loadTarget, resolveBecomeSecrets, resolveSecret, scmProbe, sshExec, TRACE_PROBE } from '@supops/core';
+import { OBSERVABILITY_KINDS, isObservabilityKind, isScmKind } from '@supops/shared';
 import { watcher } from '../observe/watcher.ts';
 import type { ObservabilityConfig } from '@supops/db';
 import type { ResolvedTarget } from '@supops/core';
@@ -113,7 +113,19 @@ const observabilityAuth = z.discriminatedUnion('type', [
   z.object({ type: z.literal('basic'), username: z.string().min(1).max(200), password: z.string().min(1).max(1000) }),
 ]);
 
-const targetConfig = z.union([z.discriminatedUnion('kind', [sshConfig, k8sConfig]), observabilityConfig]);
+/** GitHub or GitLab, read-only, limited to the repositories listed. */
+const scmConfig = z.object({
+  kind: z.enum(['github', 'gitlab']),
+  baseUrl: z.string().url().max(500).refine((u) => /^https?:\/\//.test(u), 'Use an http:// or https:// URL'),
+  repos: z.array(z.string().trim().min(3).max(200).regex(/^[A-Za-z0-9_.*-]+(\/[A-Za-z0-9_.*-]+)+$/, 'owner/name or group/project; * allowed')).min(1, 'List at least one repository').max(100),
+  allowPrivateNetwork: z.boolean().default(false),
+  insecureSkipVerify: z.boolean().optional(),
+});
+
+const targetConfig = z.union([z.discriminatedUnion('kind', [sshConfig, k8sConfig]), observabilityConfig, scmConfig]);
+
+/** Observability and source-control connections: reached over an HTTP API, with a stored token. */
+const isApiKind = (k: string) => isObservabilityKind(k) || isScmKind(k);
 
 /** Store (or clear) an observability connection's credential; returns the credential id or null. */
 function observabilityCredential(projectId: string, slug: string, auth: z.infer<typeof observabilityAuth>): string | null {
@@ -201,8 +213,18 @@ targetRoutes.post('/', (req, res) => {
     return;
   }
   const { secret, becomePasswords, auth, ...target } = parsed.data;
+  // Checked before any credential is stored, so a clash leaves nothing behind.
+  const taken = db
+    .select({ id: targets.id })
+    .from(targets)
+    .where(and(eq(targets.projectId, target.projectId), eq(targets.slug, target.slug)))
+    .get();
+  if (taken) {
+    res.status(409).json({ error: `A target named "${target.slug}" already exists in this project. Pick a different name.` });
+    return;
+  }
 
-  if (isObservabilityKind(target.config.kind)) {
+  if (isApiKind(target.config.kind)) {
     const row = db
       .insert(targets)
       .values({
@@ -648,11 +670,18 @@ targetRoutes.post('/:id/test', async (req, res) => {
     signal: AbortSignal.timeout(50_000),
     onNewHostKey: (fp: string) => pinHostKey(db, target.id, fp),
   };
+  // Source control: read the first allowed repository with the token.
+  if (isScmKind(target.kind)) {
+    const r = await scmProbe(ctx);
+    db.update(targets).set({ healthState: r.ok ? 'ok' : 'unreachable', lastCheckedAt: new Date() }).where(eq(targets.id, target.id)).run();
+    res.json(r);
+    return;
+  }
   // Observability backends: one cheap read-only API call.
   if (isObservabilityKind(target.kind)) {
     const cfg = target.config as unknown as ObservabilityConfig;
     const probe: Record<string, string> = {
-      prometheus: '/api/v1/status/buildinfo', alertmanager: '/api/v2/status', loki: '/loki/api/v1/labels', elasticsearch: '/',
+      prometheus: '/api/v1/status/buildinfo', alertmanager: '/api/v2/status', loki: '/loki/api/v1/labels', elasticsearch: '/', ...TRACE_PROBE,
       grafana: cfg.datasourceUid ? `/api/datasources/proxy/uid/${cfg.datasourceUid}/api/v1/status/buildinfo` : '/api/health',
     };
     let ok = false;
@@ -663,9 +692,9 @@ targetRoutes.post('/:id/test', async (req, res) => {
         baseUrl: cfg.baseUrl,
         path: probe[target.kind]!,
         headers: {
-          ...(auth?.type === 'bearer' ? { authorization: `Bearer ${auth.token}` } : {}),
+          ...(auth?.type === 'bearer' ? (target.kind === 'signoz' ? { 'SIGNOZ-API-KEY': auth.token! } : { authorization: `Bearer ${auth.token}` }) : {}),
           ...(auth?.type === 'basic' ? { authorization: `Basic ${Buffer.from(`${auth.username}:${auth.password}`).toString('base64')}` } : {}),
-          ...(cfg.tenantId ? { 'X-Scope-OrgID': cfg.tenantId } : {}),
+          ...(cfg.tenantId && (cfg.kind === 'loki' || cfg.kind === 'tempo') ? { 'X-Scope-OrgID': cfg.tenantId } : {}),
         },
         allowPrivateNetwork: cfg.allowPrivateNetwork,
         insecureSkipVerify: cfg.insecureSkipVerify,
@@ -754,7 +783,7 @@ targetRoutes.patch('/:id', (req, res) => {
 
   const { secret, becomePasswords, auth, ...fields } = parsed.data;
 
-  if (isObservabilityKind(existing.kind) || (fields.config && isObservabilityKind(fields.config.kind))) {
+  if (isApiKind(existing.kind) || (fields.config && isApiKind(fields.config.kind))) {
     if (fields.config && fields.config.kind !== existing.kind) {
       res.status(400).json({ error: 'A connection cannot change kind; create a new one.' });
       return;

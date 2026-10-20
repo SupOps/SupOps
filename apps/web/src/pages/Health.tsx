@@ -11,6 +11,7 @@ import { PageHeader } from '../components/Layout';
 import { Empty, EnvBadge, HealthBadge, Panel, Segmented, Spinner, Switch } from '../components/ui';
 import { topLevelTargets } from '../lib/types';
 import type { HealthIssue, HealthOverview, HealthSchedule, HealthTargetMetric, Target } from '../lib/types';
+import { useLivePoll } from '../lib/live';
 
 /** The cadences the timer offers -- must match the server's ALLOWED_INTERVALS. */
 const INTERVALS: Array<{ ms: number; label: string; long: string }> = [
@@ -34,7 +35,7 @@ export function Health() {
     queryKey: ['health', projectId],
     queryFn: () => api<HealthOverview>(`/health/overview?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
   });
 
   const targets = useQuery({

@@ -14,6 +14,7 @@ export type RunEventPayload =
   | { type: 'assistant_text'; text: string }
   | { type: 'tool_call'; toolCallId: string; toolKey: string; target: string | null; rendered: string }
   | { type: 'tool_classified'; toolCallId: string; tier: RiskTier; assessment: RiskAssessment }
+  | { type: 'tool_simulated'; toolCallId: string; status: 'observed' | 'skipped' | 'unavailable' | 'error'; tier: RiskTier }
   | { type: 'tool_blocked'; toolCallId: string; reason: string }
   | { type: 'tool_started'; toolCallId: string }
   | { type: 'tool_result'; toolCallId: string; ok: boolean; text: string; exitCode?: number }

@@ -20,6 +20,7 @@ import { ToolRegistry } from '../tools/registry.ts';
 import type { ToolDef } from '../tools/types.ts';
 import { okOutput } from '../tools/output.ts';
 import { Engine } from './runner.ts';
+import type { EngineOptions } from './runner.ts';
 import { nullSink } from './events.ts';
 
 setMasterKey(Buffer.alloc(32, 7));
@@ -147,10 +148,10 @@ export function seedRun(db: Db, tools: ToolSpec[], task = 'investigate'): string
   return run.id;
 }
 
-export function makeEngine(db: Db, llm: ScriptedLLM, defs: ToolDef<never>[]): Engine {
+export function makeEngine(db: Db, llm: ScriptedLLM, defs: ToolDef<never>[], opts: { simulate?: EngineOptions['simulate'] } = {}): Engine {
   const registry = new ToolRegistry();
   for (const d of defs) registry.register(d);
   return new Engine({
-    db, llm: llm.asClient(), registry, sink: nullSink, workerId: 'test-worker',
+    db, llm: llm.asClient(), registry, sink: nullSink, workerId: 'test-worker', ...(opts.simulate ? { simulate: opts.simulate } : {}),
   });
 }

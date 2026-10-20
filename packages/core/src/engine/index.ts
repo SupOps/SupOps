@@ -4,6 +4,7 @@ export * from './events.ts';
 export * from './execute.ts';
 export * from './targets.ts';
 export * from './prompt.ts';
+export * from './skills.ts';
 export * from './context.ts';
 export * from './canonical.ts';
 export * from './host-match.ts';

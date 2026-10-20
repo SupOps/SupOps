@@ -1,21 +1,28 @@
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
+import { nanoid } from 'nanoid';
 import type { ChatMessage, RiskAssessment, ToolCallRequest, ToolMessage } from '@supops/shared';
-import { isTerminalToolCall, tierAtMost } from '@supops/shared';
+import { isTerminalRun, isTerminalToolCall, tierAtMost, tierRank } from '@supops/shared';
 import type { Db, RunBudget } from '@supops/db';
-import { DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_SESSION_TOOL_CALLS, agents, knowledgeDocs, projects, runKnowledge, toolCalls as toolCallsTable, trustedCommands, users } from '@supops/db';
+import { DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_SESSION_TOOL_CALLS, agents, knowledgeDocs, learnedRules as learnedRulesTable, projects, runKnowledge, toolCalls as toolCallsTable, toolOutputs as toolOutputsTable, trustedCommands, users, runSteps } from '@supops/db';
 import type { LLMClient } from '../llm/client.ts';
 import { backoffMs } from '../llm/client.ts';
 import { FatalLLMError, RetryableLLMError } from '../llm/errors.ts';
-import type { KnowledgeAccess, ResolvedTarget, ResolvedTool, ToolDef } from '../tools/types.ts';
-import { KNOWLEDGE_TOOL_KEYS, OBSERVABILITY_TOOL_KEYS } from '../tools/builtin.ts';
+import type { KnowledgeAccess, OutputAccess, ResolvedTarget, ResolvedTool, ToolDef } from '../tools/types.ts';
+import { KNOWLEDGE_TOOL_KEYS, OBSERVABILITY_TOOL_KEYS, SESSION_TOOL_KEYS } from '../tools/builtin.ts';
+import { FULL_OUTPUT_BYTES, readOutputTool } from '../tools/read-output.ts';
+import { planFromArgs, planTool, renderPlan, type PlanStep } from '../tools/plan.ts';
+import { truncateOutput } from '../tools/output.ts';
 import { readRunKnowledge, searchRunKnowledge, type RunScope } from '../knowledge/retrieve.ts';
 import { bindTools, effectiveToolKeys, type ToolRegistry } from '../tools/registry.ts';
-import { assessRisk, matchesRule, trustEnvOf, trustText } from '../risk/index.ts';
+import { assessRisk, matchesRule, trustEnvOf, trustText, withObservations } from '../risk/index.ts';
+import { simulate } from '../sim/index.ts';
 import type { EventSink, OutputSink } from './events.ts';
 import { nullOutputSink } from './events.ts';
 import { executeToolCall, ToolExecutionRefused } from './execute.ts';
-import { DEFAULT_CONTEXT_TOKENS, fitToContext } from './context.ts';
+import { COMPACT_AT, COMPACTION_PROMPT, compactionCut, DEFAULT_CONTEXT_TOKENS, elideOldOutputs, estimateTokens, fitToContext, transcriptFor } from './context.ts';
 import { signatureOf } from '../learning/signature.ts';
+import { harvest } from '../learning/harvest.ts';
+import { preflightWarning, stuckNote, verifyNote } from './self-check.ts';
 import { hashArgs, targetFingerprint } from './canonical.ts';
 import { loadTargets } from './targets.ts';
 import { isNetworkTarget, netCheckTool, NETWORK_TARGET } from '../tools/net-check.ts';
@@ -33,6 +40,36 @@ const MAX_CONTINUATIONS = 2;
  */
 const MAX_PROVIDER_RETRIES = 8;
 
+/** Read-only calls in one model turn that may run at the same time. */
+const PARALLEL_READS = 4;
+/** A shadow simulation older than this is re-checked before a human-approved change runs. */
+const RESIM_STALE_MS = 10 * 60_000;
+/** The self-check nudges (verify / stuck / pre-flight) can be switched off for weak models. */
+const selfCheckOn = () => process.env.SUPOPS_SELFCHECK !== 'off';
+
+/**
+ * The fail-closed sandbox gate. When on, a non-read-only action that a sandbox could
+ * NOT actually verify is blocked rather than left to run on real infrastructure after a
+ * (possibly mistaken) approval -- the point being that a malicious payload's real impact
+ * is absorbed in the sandbox, not on the box.
+ *
+ * - `off`     (default): raise-only, fail-open. The sandbox only escalates what it catches.
+ * - `scripts`: block an unverified run_script (always detonatable when a detonator is up).
+ * - `prod`:    block any unverified non-read-only action on a production target.
+ * - `all`:     block any unverified non-read-only action.
+ *
+ * NOTE: `all` without a sandbox backend that can observe arbitrary commands (the target
+ * shadow) blocks most changes, because most commands have no native dry-run. That is the
+ * safe-but-strict trade; `scripts`/`prod` are the usable middle ground until the shadow
+ * (or detonator) is running.
+ */
+type SandboxGate = 'off' | 'scripts' | 'prod' | 'all';
+const sandboxGate = (): SandboxGate => {
+  const v = process.env.SUPOPS_SANDBOX_GATE;
+  return v === 'scripts' || v === 'prod' || v === 'all' ? v : 'off';
+};
+const PROD_ENVS = new Set(['production', 'prod', 'live']);
+
 export interface EngineOptions {
   db: Db;
   llm: LLMClient;
@@ -41,6 +78,8 @@ export interface EngineOptions {
   /** Optional live command output. Omitted, execution is unchanged. */
   output?: OutputSink;
   workerId: string;
+  /** Shadow-execution simulator. Defaults to the real one; tests inject a fake. */
+  simulate?: typeof simulate;
 }
 
 export class Engine {
@@ -51,6 +90,7 @@ export class Engine {
   private sink: EventSink;
   private output: OutputSink;
   private workerId: string;
+  private simulate: typeof simulate;
   private aborts = new Map<string, AbortController>();
 
   constructor(opts: EngineOptions) {
@@ -61,6 +101,7 @@ export class Engine {
     this.sink = opts.sink;
     this.output = opts.output ?? nullOutputSink;
     this.workerId = opts.workerId;
+    this.simulate = opts.simulate ?? simulate;
   }
 
   /** Cooperative cancellation for an in-flight tool call. */
@@ -93,6 +134,12 @@ export class Engine {
         const progressed = await this.tick(runId, abort.signal);
         if (!progressed) break;
       }
+    } catch (err) {
+      // A bug, not the model or a tool (those are handled where they happen). Fail the
+      // run with the reason rather than leave it "running" with nobody working on it.
+      const run = this.store.getRun(runId);
+      if (run && !isTerminalRun(run.status)) this.fail(runId, `SupOps hit an internal error and stopped this run: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     } finally {
       clearInterval(heartbeat);
       this.aborts.delete(runId);
@@ -121,10 +168,29 @@ export class Engine {
     // --- Phase A: settle any tool calls left outstanding -------------------
     const open = this.store.getUnsettledToolCalls(runId);
     if (open.length > 0) {
+      // Calls are taken in the model's order. Consecutive read-only calls that need
+      // no approval run together; anything else runs alone, after everything before
+      // it has finished, so a change is never raced against the checks around it.
+      let batch: ToolCallRow[] = [];
+      const flush = async () => {
+        for (let i = 0; i < batch.length; i += PARALLEL_READS) {
+          await Promise.all(batch.slice(i, i + PARALLEL_READS).map((c) => this.settleCall(run, ctx, c, signal)));
+        }
+        batch = [];
+      };
       for (const call of open) {
         if (signal.aborted) return false;
-        await this.settleCall(run, ctx, call, signal);
+        if (call.state === 'proposed' && !(await this.classify(run, ctx, call, signal))) continue;
+        const current = this.store.getToolCall(call.id);
+        if (current && this.readsOnly(current)) {
+          batch.push(current);
+          continue;
+        }
+        await flush();
+        if (current) await this.settleCall(run, ctx, current, signal);
       }
+      await flush();
+      if (signal.aborted) return false;
 
       const after = this.store.getUnsettledToolCalls(runId);
       if (after.some((c) => c.state === 'awaiting_approval')) {
@@ -152,8 +218,23 @@ export class Engine {
 
   private async step(run: RunRow, ctx: RunContext, signal: AbortSignal): Promise<boolean> {
     // Old command output is elided on the wire once the conversation outgrows the
-    // budget; the stored history is untouched.
-    const { messages } = fitToContext(this.store.wireMessages(run.id), ctx.budget.contextTokens ?? DEFAULT_CONTEXT_TOKENS);
+    // budget; past that, the model summarises the older turns once (compact), and the
+    // mechanical recap in fitToContext is the last resort. The stored history is untouched.
+    const budget = ctx.budget.contextTokens ?? DEFAULT_CONTEXT_TOKENS;
+    // Going round in circles (the same action again, or failure after failure): say so
+    // before the next model call, once per pattern.
+    const stuck = selfCheckOn() ? stuckNote(this.store.toolCallsThisTurn(run.id), this.store.engineNotesThisTurn(run.id)) : null;
+    if (stuck) this.store.appendStep(run.id, { role: 'user', content: stuck }, { origin: 'engine' });
+    let compaction = run.compaction ?? null;
+    let wire = this.store.wireMessages(run.id, compaction);
+    if (elideOldOutputs(wire, budget).total > budget * COMPACT_AT) {
+      const next = await this.compact(run, compaction, budget);
+      if (next) {
+        compaction = next;
+        wire = this.store.wireMessages(run.id, compaction);
+      }
+    }
+    const { messages } = fitToContext(wire, budget);
 
     // A run records the model it started with, but the provider can be changed from
     // the UI while a run is parked at an approval gate. Sending a Gemini model name
@@ -206,6 +287,21 @@ export class Engine {
     // The provider answered, so any accumulated backoff is stale.
     if (run.retryCount > 0) this.store.clearRetries(run.id);
 
+    // Tool-call ids come from the provider, and not every provider makes them unique:
+    // local models (Ollama, LM Studio) and some OpenAI-compatible APIs start again at
+    // call_0 in every conversation, or send none. SupOps keys calls by id across all
+    // runs, so a reused, repeated or missing id gets one of SupOps' own -- before the
+    // reply is stored, so the conversation history and the tool results agree.
+    if (result.message.tool_calls?.length) {
+      const taken = this.store.takenToolCallIds(result.message.tool_calls.map((c) => c.id));
+      const seen = new Set<string>();
+      result.message.tool_calls = result.message.tool_calls.map((c) => {
+        const id = !c.id || seen.has(c.id) || taken.has(c.id) ? `call_${nanoid(16)}` : c.id;
+        seen.add(id);
+        return id === c.id ? c : { ...c, id };
+      });
+    }
+
     const step = this.store.appendStep(run.id, result.message, {
       finishReason: result.finishReason,
       promptTokens: result.promptTokens,
@@ -234,6 +330,32 @@ export class Engine {
       return true;
     }
 
+    // About to conclude after a change nobody has checked: verify first (once a turn).
+    if (requested.length === 0 && selfCheckOn()) {
+      const verify = verifyNote(this.store.toolCallsThisTurn(run.id), this.store.engineNotesThisTurn(run.id));
+      if (verify) {
+        this.store.appendStep(run.id, { role: 'user', content: verify }, { origin: 'engine' });
+        return true;
+      }
+    }
+
+    // Before concluding: if the turn was empty (no action and no answer) OR the plan
+    // still shows open steps, nudge the model to finish rather than silently ending a
+    // run that looks unfinished. Bounded like the cut-off continuation so a stuck model
+    // cannot loop. A turn that ran out of length is handled above.
+    const CONCLUDE_MARK = '[SupOps] Before you conclude';
+    const priorConcludeNudges = this.store.engineNotesThisTurn(run.id).filter((t) => t.startsWith(CONCLUDE_MARK)).length;
+    const hasAnswer = !!result.message.content?.trim();
+    const openSteps = (this.currentPlan(run.id) ?? []).filter((s) => s.status === 'todo' || s.status === 'doing');
+    if (requested.length === 0 && priorConcludeNudges < MAX_CONTINUATIONS && (!hasAnswer || openSteps.length)) {
+      const planNote = openSteps.length ? ` your plan still shows ${openSteps.length} step${openSteps.length === 1 ? '' : 's'} not done (next: "${openSteps[0]!.step}").` : '';
+      const msg = !hasAnswer
+        ? `${CONCLUDE_MARK}: your last turn was empty -- no action and no final answer, and${planNote || ' there is more to do.'} Take the next step now, or give your final answer. If you genuinely cannot proceed, say so and why.`
+        : `${CONCLUDE_MARK}:${planNote} Finish those steps, or -- if you have already covered them -- mark each done or dropped with update_plan, then give your final answer.`;
+      this.store.appendStep(run.id, { role: 'user', content: msg }, { origin: 'engine' });
+      return true;
+    }
+
     if (requested.length === 0) {
       // A one-shot run is done. An interactive session is only done with *this*
       // turn -- it parks and waits for the next message, which `rebuildMessages`
@@ -256,8 +378,17 @@ export class Engine {
       // no separate parked state to get stuck in, and the run is terminal, so it
       // can be deleted like any other.
       const next = 'succeeded';
-      this.store.setStatus(run.id, next);
-      this.event(run.id, { type: 'status', status: next });
+      // A conclusion that carries no answer (the model gave up after the nudges, or the
+      // plan is unfinished) should not read as a clean success -- say so, so the person
+      // knows to send a message to continue.
+      const open = (this.currentPlan(run.id) ?? []).filter((s) => s.status === 'todo' || s.status === 'doing');
+      const reason = !result.message.content?.trim()
+        ? `ended without a final answer${open.length ? ` and with ${open.length} plan step${open.length === 1 ? '' : 's'} unfinished` : ''} -- send a message to continue`
+        : open.length
+          ? `the answer is in, but ${open.length} plan step${open.length === 1 ? '' : 's'} ${open.length === 1 ? 'is' : 'are'} still marked unfinished ("${open[0]!.step}") -- continue if it is not done`
+          : null;
+      this.store.setStatus(run.id, next, reason);
+      this.event(run.id, { type: 'status', status: next, ...(reason ? { reason } : {}) });
       return false;
     }
 
@@ -302,7 +433,7 @@ export class Engine {
     signal: AbortSignal,
   ): Promise<void> {
     if (call.state === 'proposed') {
-      const classified = this.classify(run, ctx, call);
+      const classified = await this.classify(run, ctx, call, signal);
       if (!classified) return; // classify() already marked it blocked
     }
 
@@ -318,6 +449,41 @@ export class Engine {
       return;
     }
 
+    // TOCTOU: a human may have approved this a while ago, and the target's state can
+    // have drifted since the simulation ran (the packages a removal would take, the
+    // object a patch would change). Re-simulate a stale, human-approved change before
+    // running it; if it now looks worse than what was approved, send it back for a
+    // fresh decision rather than acting on one that no longer holds.
+    if (
+      current.state === 'approved' && current.riskJson?.observed && current.tier !== 'read_only' &&
+      Date.now() - current.riskJson.observed.at > RESIM_STALE_MS && !run.policySnapshot.advisory && !isNetworkTarget(target)
+    ) {
+      try {
+        const resim = await this.simulate({ db: this.db, tool, target, args: current.argsJson, runId: run.id, toolCallId: current.toolCallId, signal });
+        if (resim.status !== 'skipped') {
+          const updated = withObservations(current.riskJson, resim.contributions);
+          const observed = { status: resim.status, simulator: resim.simulator, ...(resim.command ? { command: resim.command } : {}), ...(resim.note ? { note: resim.note } : {}), items: resim.observations.map((o) => ({ kind: o.kind, detail: o.detail })), ...(resim.blindSpots?.length ? { blindSpots: resim.blindSpots } : {}), at: Date.now() };
+          if (tierRank(updated.tier) > tierRank(current.tier ?? 'read_only')) {
+            // Worse than what was approved. Re-park (or block) and drop the stale decision.
+            const next = { ...updated, observed, decision: updated.decision === 'block' ? ('block' as const) : ('approve' as const) };
+            this.store.updateToolCall(current.id, { state: next.decision === 'block' ? 'blocked' : 'awaiting_approval', tier: next.tier, riskJson: next, decidedBy: null, decidedAt: null } as never);
+            this.event(run.id, { type: 'tool_classified', toolCallId: current.toolCallId, tier: next.tier, assessment: next });
+            if (next.decision === 'block') {
+              this.store.updateToolCall(current.id, { resultJson: { ok: false, text: `BLOCKED on re-check: the simulation now shows a worse effect than when this was approved.` }, isError: true, finishedAt: new Date() } as never);
+              this.event(run.id, { type: 'tool_blocked', toolCallId: current.toolCallId, reason: 'the pre-execution re-check found a worse effect' });
+            } else {
+              this.event(run.id, { type: 'approval_required', toolCallId: current.toolCallId, tier: next.tier, rendered: current.renderedCommand ?? '' });
+            }
+            return; // do not run on the stale approval
+          }
+          // Not worse: just refresh the timestamp so we do not re-simulate every tick.
+          this.store.updateToolCall(current.id, { riskJson: { ...current.riskJson, observed: { ...current.riskJson.observed, at: Date.now() } } } as never);
+        }
+      } catch (err) {
+        console.warn(`re-simulation error for ${current.toolCallId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     this.event(run.id, { type: 'tool_started', toolCallId: current.toolCallId });
 
     let output;
@@ -327,7 +493,8 @@ export class Engine {
           db: this.db,
           store: this.store,
           killSwitchActive: () => !!this.store.getRun(run.id) && ctx.killSwitch,
-          maxOutputBytes: ctx.budget.maxOutputBytesPerCall,
+          // Captured whole (up to FULL_OUTPUT_BYTES); the model is shown the budget's worth below.
+          maxOutputBytes: Math.max(FULL_OUTPUT_BYTES, ctx.budget.maxOutputBytesPerCall),
           onChunk: (chunk) => this.output.chunk(run.id, current.toolCallId, chunk),
         },
         {
@@ -338,6 +505,7 @@ export class Engine {
           toolsSnapshotKeys: run.toolsSnapshot.map((t) => t.function.name),
           signal,
           ...(KNOWLEDGE_TOOL_KEYS.includes(current.toolKey) ? { knowledge: this.knowledgeAccess(run, ctx.knowledgeScope) } : {}),
+          ...(current.toolKey === readOutputTool.key ? { outputs: this.outputAccess(run.id) } : {}),
         },
       );
     } catch (err) {
@@ -348,6 +516,22 @@ export class Engine {
       output = { ok: false, text: `Execution failed: ${err instanceof Error ? err.message : String(err)}` };
     }
 
+    // Longer than the model should read at once: keep it whole, show the head and tail,
+    // and say how to read the rest (read_output) instead of running the command again.
+    const budget = ctx.budget.maxOutputBytesPerCall;
+    const bytes = Buffer.byteLength(output.text);
+    if (bytes > budget && current.toolKey !== readOutputTool.key) {
+      this.db.insert(toolOutputsTable).values({ toolCallId: current.id, runId: run.id, text: output.text, bytes }).onConflictDoNothing().run();
+      const view = truncateOutput(output.text, budget);
+      output = {
+        ...output,
+        text:
+          `${view.text}\n\n[Full output kept by SupOps: ${bytes.toLocaleString()} bytes, ${output.text.split('\n').length.toLocaleString()} lines. ` +
+          `Read any part with read_output {"call": "${current.toolCallId}", "grep": "..."} or {"call": "${current.toolCallId}", "offset": <line>} ` +
+          `instead of running the command again.]`,
+      };
+    }
+
     this.store.updateToolCall(current.id, {
       state: output.outcome ?? (output.ok ? 'succeeded' : 'failed'),
       resultJson: output,
@@ -355,6 +539,14 @@ export class Engine {
       exitCode: output.exitCode ?? null,
       finishedAt: new Date(),
     } as never);
+    // A change that ran on its own and failed teaches the engine to ask next time.
+    if (!output.ok && !output.outcome && current.signature && current.riskJson?.decision === 'auto' && current.tier !== 'read_only') {
+      try {
+        harvest(this.db, run.projectId, current.signature);
+      } catch (err) {
+        console.warn(`learning: could not record the failed change: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
     this.event(run.id, {
       type: 'tool_result',
@@ -365,7 +557,7 @@ export class Engine {
     });
   }
 
-  private classify(run: RunRow, ctx: RunContext, call: ToolCallRow): boolean {
+  private async classify(run: RunRow, ctx: RunContext, call: ToolCallRow, signal: AbortSignal): Promise<boolean> {
     // Checked first: a cut-off call has no usable arguments at all, target included.
     if (call.argsJson.__truncated) {
       this.blockCall(
@@ -437,6 +629,11 @@ export class Engine {
       }
     }
 
+    const learnedRules = this.db
+      .select()
+      .from(learnedRulesTable)
+      .where(and(eq(learnedRulesTable.projectId, run.projectId), eq(learnedRulesTable.status, 'active')))
+      .all();
     let assessment = assessRisk({
       def: tool.def,
       args: call.argsJson,
@@ -444,7 +641,65 @@ export class Engine {
       target,
       policy: run.policySnapshot,
       trigger: run.trigger,
+      learned: { signature, rules: learnedRules },
     });
+    for (const c of assessment.contributions) {
+      if (c.stage === 'learned' && c.ruleId) {
+        this.db
+          .update(learnedRulesTable)
+          .set({ hits: sql`${learnedRulesTable.hits} + 1`, lastHitAt: new Date() })
+          .where(eq(learnedRulesTable.id, c.ruleId.slice('learned.'.length)))
+          .run();
+      }
+    }
+
+    // Shadow execution: before approval, see what the action would ACTUALLY do (a
+    // native dry-run today; the target/detonation sandbox in later phases). It only
+    // ever raises -- a quiet simulation never unlocks anything, and if the sandbox
+    // cannot run, nothing is added (fail closed). Run it for anything that is not
+    // plainly read-only, including an auto-approved change, so a cascade the rules
+    // never saw (e.g. apt removing sshd) can still stop the action.
+    // A script is always detonated, whatever its text classified as: malice hides in a
+    // script that reads benign. Everything else is simulated only when it is not plainly
+    // read-only.
+    const alwaysSimulate = tool.def.key === 'run_script';
+    // Whether a simulator actually ran and observed this action (status 'observed').
+    // 'skipped'/'unavailable'/'error' all mean it was NOT verified -- the gate below cares.
+    let simObserved = false;
+    if (assessment.decision !== 'block' && (assessment.tier !== 'read_only' || alwaysSimulate) && !run.policySnapshot.advisory && !isNetworkTarget(target)) {
+      try {
+        const sim = await this.simulate({ db: this.db, tool, target, args: call.argsJson, runId: run.id, toolCallId: call.toolCallId, signal });
+        simObserved = sim.status === 'observed';
+        if (sim.status !== 'skipped') {
+          assessment = withObservations(assessment, sim.contributions);
+          assessment = { ...assessment, observed: { status: sim.status, simulator: sim.simulator, ...(sim.command ? { command: sim.command } : {}), ...(sim.note ? { note: sim.note } : {}), items: sim.observations.map((o) => ({ kind: o.kind, detail: o.detail })), ...(sim.blindSpots?.length ? { blindSpots: sim.blindSpots } : {}), at: Date.now() } };
+          this.event(run.id, { type: 'tool_simulated', toolCallId: call.toolCallId, status: sim.status, tier: assessment.tier });
+        }
+      } catch (err) {
+        // A simulation failure must never fail the run or relax the tier.
+        console.warn(`simulation error for ${call.toolCallId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Fail-closed sandbox gate: a change the sandbox could not verify should not reach
+    // real infrastructure on a (possibly mistaken) approval. Raise it to forbidden so no
+    // approval can authorise it -- the operator brings up the sandbox or relaxes the gate.
+    const gate = sandboxGate();
+    const gated =
+      gate === 'all' ? true : gate === 'scripts' ? tool.def.key === 'run_script' : gate === 'prod' ? PROD_ENVS.has(target.env) : false;
+    if (
+      gate !== 'off' && gated && !simObserved &&
+      assessment.decision !== 'block' && assessment.tier !== 'read_only' &&
+      !run.policySnapshot.advisory && !isNetworkTarget(target)
+    ) {
+      assessment = withObservations(assessment, [{
+        stage: 'observed',
+        tier: 'forbidden',
+        reason:
+          `the sandbox could not verify what this would do before it ran, and the sandbox gate ` +
+          `(${gate}) blocks unverified changes -- bring up the detonator/target-shadow, or relax SUPOPS_SANDBOX_GATE`,
+      }]);
+    }
 
     // A person already approved exactly this (a trusted command): skip the wait, keep
     // the tier. Never for a forbidden action (that is 'block'), and never in automatic
@@ -452,6 +707,11 @@ export class Engine {
     if (assessment.decision === 'approve' && !run.policySnapshot.unattended && !run.policySnapshot.advisory && !isNetworkTarget(target)) {
       const trusted = this.trustedFor(run.projectId, call.toolKey, call.argsJson, target);
       if (trusted) assessment = { ...assessment, decision: 'auto', trusted };
+    }
+    // Tell the approver when a change comes before anything on that machine was read.
+    if (selfCheckOn() && assessment.decision === 'approve' && assessment.tier !== 'read_only' && !isNetworkTarget(target)) {
+      const preflight = preflightWarning(this.store.toolCallsInRun(run.id), target.id, target.slug);
+      if (preflight) assessment = { ...assessment, preflight };
     }
 
     this.store.updateToolCall(call.id, {
@@ -539,6 +799,28 @@ export class Engine {
     return { ruleId: hit.id, by, byName };
   }
 
+  /** The run's to-do list as its latest update_plan call left it. */
+  private currentPlan(runId: string): PlanStep[] | null {
+    const row = this.db
+      .select({ args: toolCallsTable.argsJson })
+      .from(toolCallsTable)
+      .innerJoin(runSteps, eq(runSteps.id, toolCallsTable.stepId))
+      .where(and(eq(toolCallsTable.runId, runId), eq(toolCallsTable.toolKey, planTool.key), eq(toolCallsTable.state, 'succeeded')))
+      .orderBy(desc(runSteps.seq), desc(toolCallsTable.callIndex))
+      .limit(1)
+      .get();
+    return row ? planFromArgs(row.args) : null;
+  }
+
+  /**
+   * Cleared to run now and classified read-only (this call, not the tool: ssh_exec
+   * running `df -h` reads), so it is safe beside other such calls. Each call opens its
+   * own connection.
+   */
+  private readsOnly(call: ToolCallRow): boolean {
+    return call.state === 'auto_approved' && call.tier === 'read_only';
+  }
+
   private blockCall(call: ToolCallRow, reason: string): void {
     this.store.updateToolCall(call.id, {
       state: 'blocked',
@@ -606,7 +888,7 @@ export class Engine {
       const keys = new Set(snapshotKeys);
       const defs = [
         ...(run.policySnapshot.networkChecks && keys.has(netCheckTool.key) ? [netCheckTool as never as ToolDef<never>] : []),
-        ...KNOWLEDGE_TOOL_KEYS.filter((k) => keys.has(k)).map((k) => this.registry.get(k)).filter((d): d is NonNullable<typeof d> => !!d),
+        ...[...KNOWLEDGE_TOOL_KEYS, ...SESSION_TOOL_KEYS].filter((k) => keys.has(k)).map((k) => this.registry.get(k)).filter((d): d is NonNullable<typeof d> => !!d),
       ];
       // Observability connections in the snapshot stay readable (see start-run).
       const obsDefs = OBSERVABILITY_TOOL_KEYS.filter((k) => keys.has(k)).map((k) => this.registry.get(k)).filter((d): d is NonNullable<typeof d> => !!d);
@@ -630,6 +912,62 @@ export class Engine {
         targetIds: targets.map((t) => t.id),
         kinds: [...new Set(targets.map((t) => t.kind))],
         envs: [...new Set(targets.map((t) => t.env))],
+      },
+    };
+  }
+
+  /** Runs whose summary request failed recently, so a broken provider is not asked every step. */
+  private compactFailed = new Map<string, number>();
+
+  /**
+   * Ask the model to summarise the older part of the conversation, and keep the summary
+   * (runs.compaction) to send in its place. Only accepted when it is clearly smaller.
+   * Null when there is nothing worth summarising or the request failed.
+   */
+  private async compact(run: RunRow, current: { throughSeq: number; summary: string } | null, budget: number): Promise<{ throughSeq: number; summary: string; at: number } | null> {
+    const failedAt = this.compactFailed.get(run.id);
+    if (failedAt !== undefined && run.iteration - failedAt < 5) return null;
+    const rows = this.store.compactedRows(run.id, current);
+    const messages = rows.map((r) => r.message);
+    const cut = compactionCut(messages);
+    if (cut === null) return null;
+    const older = messages.slice(2, cut);
+    const transcript = transcriptFor(older);
+    const before = estimateTokens(older);
+    try {
+      const r = await this.llm.complete(
+        [
+          { role: 'system', content: COMPACTION_PROMPT },
+          { role: 'user', content: `The task:\n${typeof messages[1]!.content === 'string' ? messages[1]!.content.slice(0, 4000) : '[task]'}\n\nThe investigation so far:\n${transcript.slice(0, Math.floor(budget * 3))}` },
+        ],
+        [],
+        { model: run.model, maxTokens: 1500 },
+      );
+      const summary = (r.message.content ?? '').trim();
+      if (!summary || estimateTokens([{ role: 'user', content: summary }]) >= before * 0.6) throw new Error('the summary was empty or not shorter');
+      // The plan lives in a tool call that may now be summarised away: carry it over whole.
+      const plan = this.currentPlan(run.id);
+      const kept = `${summary.slice(0, 12_000)}${plan ? `\n\nYour plan as you last updated it (${planTool.key}):\n${renderPlan(plan)}` : ''}`;
+      const next = { throughSeq: rows[cut - 1]!.seq, summary: kept, at: Date.now() };
+      this.store.setCompaction(run.id, next);
+      // Its tokens are counted; it is not a step, so it does not use up the run's step budget.
+      this.store.addTokens(run.id, r.promptTokens, r.completionTokens);
+      this.compactFailed.delete(run.id);
+      return next;
+    } catch {
+      this.compactFailed.set(run.id, run.iteration);
+      return null;
+    }
+  }
+
+  /** read_output's view: this run's own results only, whole when SupOps kept them whole. */
+  private outputAccess(runId: string): OutputAccess {
+    return {
+      read: (toolCallId) => {
+        const call = this.db.select().from(toolCallsTable).where(and(eq(toolCallsTable.runId, runId), eq(toolCallsTable.toolCallId, toolCallId))).get();
+        if (!call) return null;
+        const full = this.db.select({ text: toolOutputsTable.text }).from(toolOutputsTable).where(eq(toolOutputsTable.toolCallId, call.id)).get();
+        return { toolKey: call.toolKey, rendered: call.renderedCommand ?? call.toolKey, text: full?.text ?? call.resultJson?.text ?? '' };
       },
     };
   }
@@ -694,11 +1032,12 @@ export class Engine {
    * still leaves the human something to act on, so the session ends normally.
    */
   private deadTurnReason(runId: string): string | null {
-    // `record_finding` only writes to the run's own notes, so it succeeds even when
-    // every command failed. Counting it would mask exactly the turns this catches.
+    // `record_finding` and `update_plan` only write to the run's own notes, so they
+    // succeed even when every command failed. Counting them would mask exactly the
+    // turns this catches.
     const batch = this.store
       .toolCallsThisTurn(runId)
-      .filter((c) => c.toolKey !== 'record_finding');
+      .filter((c) => c.toolKey !== 'record_finding' && c.toolKey !== planTool.key);
     if (batch.length === 0) return null;
     if (!batch.every((c) => c.state === 'blocked' || c.state === 'failed' || c.state === 'denied'))
       return null;

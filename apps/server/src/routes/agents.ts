@@ -107,7 +107,8 @@ const createBody = z.object({
 function checkAgent(projectId: string, body: { toolKeys?: string[] | null; riskPolicyOverride?: Partial<RiskPolicy> | null }): string | null {
   if (body.toolKeys !== undefined) {
     try {
-      registry.resolve(body.toolKeys);
+      // MCP tools come from the project's servers and may not be connected yet.
+      registry.resolve(body.toolKeys?.filter((k) => !k.startsWith('mcp_')) ?? null);
     } catch (err) {
       return err instanceof Error ? err.message : 'Unknown tool';
     }

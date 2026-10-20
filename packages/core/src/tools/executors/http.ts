@@ -170,3 +170,32 @@ export function safeGet(o: SafeGetOptions): Promise<SafeGetResult> {
   });
 }
 
+/**
+ * Follow one redirect, but only to an allowlisted host (e.g. the storage a CI log is
+ * served from), over https, without the original credentials, and never to a private
+ * or metadata address.
+ */
+export async function followAllowedRedirect(
+  first: SafeGetResult,
+  allowedHosts: RegExp[],
+  o: Pick<SafeGetOptions, 'timeoutMs' | 'maxBytes' | 'signal'>,
+): Promise<SafeGetResult> {
+  if (first.status < 300 || first.status >= 400 || !first.location) return first;
+  let next: URL;
+  try {
+    next = new URL(first.location);
+  } catch {
+    return first;
+  }
+  if (next.protocol !== 'https:' || !allowedHosts.some((re) => re.test(next.hostname))) return first;
+  return safeGet({
+    baseUrl: next.origin,
+    path: next.pathname,
+    query: Object.fromEntries(next.searchParams),
+    headers: { accept: '*/*' },
+    allowPrivateNetwork: false,
+    timeoutMs: o.timeoutMs,
+    maxBytes: o.maxBytes,
+    ...(o.signal ? { signal: o.signal } : {}),
+  });
+}

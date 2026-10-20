@@ -6,6 +6,7 @@ import { assertConversationValid } from '@supops/shared';
 import { DEFAULT_RISK_POLICY, runAttachments, runs, targets, toolCalls } from '@supops/db';
 import { RetryableLLMError } from '../llm/errors.ts';
 import { RunStore } from './store.ts';
+import { planTool } from '../tools/plan.ts';
 import {
   ScriptedLLM,
   SpyTool,
@@ -629,4 +630,210 @@ test('pinning the host key on first contact does not invalidate an approval', as
   db.update(runs).set({ status: 'queued' }).where(eq(runs.id, runId)).run();
   await engine.runToCompletion(runId);
   assert.deepEqual(spy.executions, ['systemctl restart nginx']);
+});
+
+test('providers that reuse tool-call ids across runs (or send none) do not crash a run', async () => {
+  const db = freshDb();
+  const spy = new SpyTool();
+  // Like Ollama or LM Studio: every conversation starts again at call_1, and a reply may repeat an id or leave it empty.
+  const script = () => [
+    { role: 'assistant' as const, content: null, tool_calls: [toolCall('call_1', 'shell', { target: 'web-1', command: 'df -h' }), toolCall('call_1', 'shell', { target: 'web-1', command: 'uptime' })] },
+    { role: 'assistant' as const, content: null, tool_calls: [toolCall('', 'shell', { target: 'web-1', command: 'free -m' })] },
+    { role: 'assistant' as const, content: 'All fine.' },
+  ];
+  const first = seedRun(db, SPEC);
+  const { id: _id, ...again } = db.select().from(runs).where(eq(runs.id, first)).get()!;
+  for (let i = 0; i < 2; i++) {
+    const runId = i === 0 ? first : db.insert(runs).values({ ...again, status: 'queued', startedAt: new Date() }).returning().get().id;
+    await makeEngine(db, new ScriptedLLM(script()), [spy.def()]).runToCompletion(runId);
+    assert.equal(db.select().from(runs).where(eq(runs.id, runId)).get()?.status, 'succeeded', `run ${i + 1}`);
+    const calls = db.select().from(toolCalls).where(eq(toolCalls.runId, runId)).all();
+    assert.equal(calls.length, 3);
+    assert.equal(new Set(calls.map((c) => c.toolCallId)).size, 3, 'each call has its own id');
+    // The stored conversation still pairs every result with its call.
+    assertConversationValid(new RunStore(db).rebuildMessages(runId));
+  }
+  assert.deepEqual(spy.executions, ['df -h', 'uptime', 'free -m', 'df -h', 'uptime', 'free -m']);
+});
+
+test('a run that hits an internal error is failed with the reason, not left "running"', async () => {
+  const db = freshDb();
+  const engine = makeEngine(db, new ScriptedLLM([{ role: 'assistant', content: 'done' }]), []);
+  const runId = seedRun(db, SPEC);
+  engine.store.appendStep = () => {
+    throw new Error('disk I/O error');
+  };
+  await assert.rejects(engine.runToCompletion(runId), /disk I\/O error/);
+  const run = db.select().from(runs).where(eq(runs.id, runId)).get()!;
+  assert.equal(run.status, 'failed');
+  assert.match(run.statusReason ?? '', /internal error.*disk I\/O error/);
+});
+
+test('a run left "running" with no lease is picked up again at start', () => {
+  const db = freshDb();
+  const runId = seedRun(db, SPEC);
+  db.update(runs).set({ status: 'running', leaseOwner: null, leaseExpiresAt: null }).where(eq(runs.id, runId)).run();
+  assert.equal(new RunStore(db).recoverStaleRuns().runs, 1);
+  assert.equal(db.select().from(runs).where(eq(runs.id, runId)).get()!.status, 'queued');
+});
+
+test('a long result is kept whole: the model sees its head and tail, and reads the middle with read_output', async () => {
+  const { readOutputTool } = await import('../tools/read-output.ts');
+  const { toolOutputs } = await import('@supops/db');
+  const db = freshDb();
+  const lines = Array.from({ length: 6000 }, (_, i) => (i === 3210 ? 'ERROR pool exhausted: 40/40 connections busy' : `line ${i + 1} ok`));
+  const long = { ...new SpyTool().def(), key: 'shell', execute: async () => ({ ok: true, text: lines.join('\n') }) } as unknown as Parameters<typeof makeEngine>[2][number];
+  const llm = new ScriptedLLM([
+    { role: 'assistant', content: null, tool_calls: [toolCall('c1', 'shell', { target: 'web-1', command: 'journalctl -u app' })] },
+    { role: 'assistant', content: null, tool_calls: [toolCall('c2', 'read_output', { target: 'supops-server', call: 'c1', grep: 'error' })] },
+    { role: 'assistant', content: null, tool_calls: [toolCall('c3', 'read_output', { target: 'supops-server', call: 'call-from-another-run' })] },
+    { role: 'assistant', content: 'The pool is exhausted.' },
+  ]);
+  const spec = [...SPEC, { type: 'function' as const, function: { name: 'read_output', description: 'x', parameters: { type: 'object' as const, properties: {}, required: [] } } }];
+  const engine = makeEngine(db, llm, [long, readOutputTool as never]);
+  const runId = seedRun(db, spec);
+  await engine.runToCompletion(runId);
+
+  const firstReply = llm.calls[1]!.find((m) => m.role === 'tool')!;
+  assert.ok(typeof firstReply.content === 'string' && firstReply.content.length < 20_000, 'the model is not handed 100 KB');
+  assert.match(firstReply.content as string, /Full output kept by SupOps: [\d,]+ bytes, 6,000 lines/);
+  assert.match(firstReply.content as string, /read_output \{"call": "c1"/);
+  assert.doesNotMatch(firstReply.content as string, /pool exhausted/, 'the middle is not in the head or tail');
+
+  const grepReply = llm.calls[2]!.filter((m) => m.role === 'tool').at(-1)!;
+  assert.match(grepReply.content as string, /1 line of 6000 match "error"/);
+  assert.match(grepReply.content as string, /3211: ERROR pool exhausted/);
+  const unknown = llm.calls[3]!.filter((m) => m.role === 'tool').at(-1)!;
+  assert.match(unknown.content as string, /No result with the id "call-from-another-run" in this run/, 'only this run\'s own results');
+  assert.equal(db.select().from(toolOutputs).all().length, 1, 'kept once, for the long result only');
+  assert.equal(db.select().from(runs).where(eq(runs.id, runId)).get()?.status, 'succeeded');
+});
+
+test('near the context limit the model summarises older turns once; the stored history is untouched', async () => {
+  const { agents } = await import('@supops/db');
+  const db = freshDb();
+  const spy = new SpyTool();
+  const long = { ...spy.def(), execute: async (a: { command: string }) => ({ ok: true, text: `${a.command}\n${'x'.repeat(3000)}` }) } as unknown as Parameters<typeof makeEngine>[2][number];
+  const script = [
+    { role: 'assistant' as const, content: null, tool_calls: [toolCall('plan1', 'update_plan', { target: 'supops-server', steps: [{ step: 'Read the app logs', status: 'doing' }, { step: 'Name the cause', status: 'todo' }] })] },
+    ...Array.from({ length: 9 }, (_, i) => ({ role: 'assistant' as const, content: null, tool_calls: [toolCall(`k${i}`, 'shell', { target: 'web-1', command: `tail -n 50 /var/log/app-${i}.log` })] })),
+    { role: 'assistant' as const, content: 'Done: the cause is in app-3.log.' },
+  ];
+  let i = 0;
+  const sent: Array<{ tools: number; messages: unknown[] }> = [];
+  const llm = {
+    config: { baseUrl: 'http://test', apiKey: 'test', model: 'test-model' },
+    async complete(messages: unknown[], tools: unknown[]) {
+      sent.push({ tools: tools.length, messages: structuredClone(messages) });
+      if (!tools.length) {
+        return { message: { role: 'assistant', content: 'Task: find the cause.\nWhat I checked: check-0 to check-2, all normal.\nCurrent hypothesis: check-3.' }, finishReason: 'stop', promptTokens: 1, completionTokens: 1, latencyMs: 1, model: 'test' };
+      }
+      if (i >= script.length) {
+        // The run gave its answer with plan steps still open, so the engine nudges to
+        // finish them. The model just restates that it is done; the run then concludes.
+        return { message: { role: 'assistant', content: 'Confirmed: the cause is in app-3.log.' }, finishReason: 'stop', promptTokens: 1, completionTokens: 1, latencyMs: 1, model: 'test' };
+      }
+      const m = script[i++]! as { role: 'assistant'; content: string | null; tool_calls?: unknown[] };
+      return { message: m, finishReason: m.tool_calls ? 'tool_calls' : 'stop', promptTokens: 1, completionTokens: 1, latencyMs: 1, model: 'test' };
+    },
+  };
+  const engine = makeEngine(db, { asClient: () => llm } as unknown as ScriptedLLM, [long, planTool as never]);
+  const runId = seedRun(db, [...SPEC, { type: 'function' as const, function: { name: 'update_plan', description: 'plan', parameters: { type: 'object' as const } } }]);
+  const run = db.select().from(runs).where(eq(runs.id, runId)).get()!;
+  const agent = db.select().from(agents).where(eq(agents.id, run.agentId)).get()!;
+  db.update(agents).set({ budget: { ...agent.budget, contextTokens: 3_000 } }).where(eq(agents.id, agent.id)).run();
+
+  await engine.runToCompletion(runId);
+
+  const summaries = sent.filter((s) => s.tools === 0);
+  assert.ok(summaries.length >= 1, 'a summary was asked for');
+  const after = db.select().from(runs).where(eq(runs.id, runId)).get()!;
+  assert.equal(after.status, 'succeeded');
+  assert.ok(after.compaction?.summary.includes('Current hypothesis'));
+  assert.match(after.compaction!.summary, /Your plan as you last updated it[\s\S]*1\. \[>\] Read the app logs/, 'the plan is carried over whole');
+  const lastSent = sent.filter((s) => s.tools > 0).at(-1)!.messages as Array<{ role: string; content: unknown }>;
+  assert.match(String(lastSent[2]!.content), /Summary of this run so far/);
+  assertConversationValid(lastSent as never);
+  // The audit trail keeps every step.
+  assert.equal(new RunStore(db).rebuildMessages(runId).filter((m) => m.role === 'tool').length, 10, 'nine reads and the plan');
+});
+
+test('independent read-only calls in one reply run together; results go back in the order asked', async () => {
+  const db = freshDb();
+  const spy = new SpyTool();
+  let running = 0;
+  let most = 0;
+  const base = spy.def();
+  const slow = {
+    ...base,
+    execute: async (a: { command: string }) => {
+      running++;
+      most = Math.max(most, running);
+      // The first call finishes last, so the order of results cannot come from timing.
+      await new Promise((r) => setTimeout(r, a.command === 'df -h' ? 60 : 10));
+      running--;
+      return { ok: true, text: `ran: ${a.command}` };
+    },
+  } as unknown as Parameters<typeof makeEngine>[2][number];
+  const llm = new ScriptedLLM([
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        toolCall('p1', 'shell', { target: 'web-1', command: 'df -h' }),
+        toolCall('p2', 'shell', { target: 'web-1', command: 'uptime' }),
+        toolCall('p3', 'shell', { target: 'web-1', command: 'free -m' }),
+      ],
+    },
+    { role: 'assistant', content: 'All three look normal.' },
+  ]);
+  const engine = makeEngine(db, llm, [slow]);
+  const runId = seedRun(db, SPEC);
+
+  await engine.runToCompletion(runId);
+
+  assert.equal(most, 3, 'the three reads overlapped');
+  const replies = llm.calls.at(-1)!.filter((m) => m.role === 'tool') as Array<{ tool_call_id: string; content: string }>;
+  assert.deepEqual(replies.map((m) => m.tool_call_id), ['p1', 'p2', 'p3']);
+  assert.match(replies[0]!.content, /df -h/);
+  assert.equal(db.select().from(runs).where(eq(runs.id, runId)).get()?.status, 'succeeded');
+});
+
+test('a change in the middle of a reply is not raced against the reads around it', async () => {
+  const db = freshDb();
+  const order: string[] = [];
+  const spy = new SpyTool();
+  const base = spy.def();
+  const logged = {
+    ...base,
+    execute: async (a: { command: string }) => {
+      order.push(`start ${a.command}`);
+      await new Promise((r) => setTimeout(r, 15));
+      order.push(`end ${a.command}`);
+      return { ok: true, text: `ran: ${a.command}` };
+    },
+  } as unknown as Parameters<typeof makeEngine>[2][number];
+  const llm = new ScriptedLLM([
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        toolCall('m1', 'shell', { target: 'web-1', command: 'df -h' }),
+        toolCall('m2', 'shell', { target: 'web-1', command: 'systemctl restart nginx', intent: 'restart', expected_effect: 'nginx restarts' }),
+        toolCall('m3', 'shell', { target: 'web-1', command: 'uptime' }),
+      ],
+    },
+    { role: 'assistant', content: 'Done.' },
+  ]);
+  const engine = makeEngine(db, llm, [logged]);
+  const runId = seedRun(db, SPEC);
+  // Let the restart run without a person, so it is a change that executes in this batch.
+  db.update(runs).set({ policySnapshot: { ...DEFAULT_RISK_POLICY, autoExecuteMaxTier: 'medium' } as never }).where(eq(runs.id, runId)).run();
+
+  await engine.runToCompletion(runId);
+
+  assert.deepEqual(order.filter((o) => o.startsWith('start')).length, 3, 'all three ran');
+  const restart = order.indexOf('start systemctl restart nginx');
+  assert.ok(order.indexOf('end df -h') < restart, 'the read before it finished first');
+  assert.ok(order.indexOf('start uptime') > order.indexOf('end systemctl restart nginx'), 'the read after it waited');
 });

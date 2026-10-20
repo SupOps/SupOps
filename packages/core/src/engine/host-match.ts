@@ -92,7 +92,7 @@ export function withMachinesBehind<T extends MatchableTarget>(scoped: T[], avail
   return [...out.values()];
 }
 
-const OBSERVABILITY = new Set(['prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana']);
+const OBSERVABILITY = new Set(['prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana', 'tempo', 'jaeger', 'signoz']);
 
 /**
  * Add every observability connection. A run limited to one machine still needs the

@@ -103,3 +103,30 @@ test('the knowledge tools read only approved documents in the run scope', () => 
   assert.equal(readRunKnowledge(db, { projectId, scope, slug: 'dev-only' }), null);
   assert.equal(readRunKnowledge(db, { projectId, scope: 'all', slug: 'dev-only' })?.title, 'Kafka on dev', 'advisory runs read every approved document');
 });
+
+test('the runbook written for an incident\'s alerts is followed in full; others for them are named', () => {
+  const { db, projectId, add } = setup();
+  const disk = add({ slug: 'disk-full', title: 'Disk full', kind: 'runbook', body: '1. df -h\n2. find the largest directory\n3. rotate logs', alertMatch: 'DiskFilling, DiskFull' });
+  add({ slug: 'disk-prod', title: 'Prod disk', kind: 'runbook', body: 'prod steps', alertMatch: 'alertname="DiskFilling", env="dev"' });
+  add({ slug: 'disk-any', title: 'Any disk alert', kind: 'runbook', body: 'generic steps', alertMatch: 'Disk*' });
+  add({ slug: 'draft-rb', title: 'Draft', kind: 'runbook', body: 'x', alertMatch: 'DiskFilling', status: 'draft' });
+  const alerts = [
+    { title: 'DiskFilling', severity: 'warning', labels: { alertname: 'DiskFilling', env: 'prod' } },
+    { title: 'DiskFull', severity: 'critical', labels: { alertname: 'DiskFull', env: 'prod' } },
+  ];
+
+  const ctx = buildKnowledgeContext(db, { projectId, scope, task: 'Investigate incident', alerts });
+  assert.match(ctx.block, /RUNBOOK FOR THESE ALERTS: Disk full \[disk-full\]\n1\. df -h/);
+  assert.match(ctx.block, /### Runbook" section: each step by number/);
+  assert.match(ctx.block, /Other runbooks written for these alerts[^\n]*\n- Any disk alert \[disk-any\]/);
+  const forAlerts = ctx.block.slice(0, ctx.block.indexOf('Other documents you can read'));
+  assert.doesNotMatch(forAlerts, /Prod disk/, 'a matcher that does not fit is not offered for these alerts');
+  assert.doesNotMatch(ctx.block, /Draft/, 'drafts never reach a run');
+  assert.deepEqual(ctx.used.filter((u) => u.via === 'alert').map((u) => u.docId), [disk.id]);
+
+  // The operator's own choice still wins.
+  const other = add({ slug: 'chosen', title: 'Chosen', kind: 'runbook', body: 'my steps' });
+  const chosen = buildKnowledgeContext(db, { projectId, scope, task: 'x', alerts, runbookId: other.id });
+  assert.match(chosen.block, /RUNBOOK TO FOLLOW: Chosen/);
+  assert.match(chosen.block, /Other runbooks written for these alerts[^\n]*\n- Disk full \[disk-full\]\n- Any disk alert/);
+});

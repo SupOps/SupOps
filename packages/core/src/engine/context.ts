@@ -38,14 +38,72 @@ export function estimateTokens(messages: ChatMessage[]): number {
   return Math.ceil(chars / 3.5) + images * IMAGE_TOKENS;
 }
 
-function elide(text: string): string {
+function elide(text: string, callId: string): string {
   const lines = text.split('\n');
   const head = lines.slice(0, 3).join('\n').slice(0, 300);
   const tail = lines.length > 6 ? lines.slice(-3).join('\n').slice(-300) : '';
   return (
     `[Earlier output elided to keep the conversation within the model's context (${text.length.toLocaleString()} characters). ` +
-    `It began:\n${head}${tail ? `\n...\nand ended:\n${tail}` : ''}\nRe-run the command if you need the full output again.]`
+    `It began:\n${head}${tail ? `\n...\nand ended:\n${tail}` : ''}\n` +
+    `SupOps still has it: read any part with read_output {"call": "${callId}", "grep": "..."} rather than running the command again.]`
   );
+}
+
+/** Ask the model to summarise once the conversation passes this share of the budget, even after eliding outputs. */
+export const COMPACT_AT = 0.9;
+
+/**
+ * Where a summary may end: just before one of the most recent `keepRecent` exchanges
+ * (an assistant turn and its tool replies). Null when there is not enough before it.
+ */
+export function compactionCut(messages: ChatMessage[], keepRecent = KEEP_RECENT): number | null {
+  const starts = messages.map((m, i) => (i > 1 && m.role === 'assistant' ? i : -1)).filter((i) => i >= 0);
+  if (starts.length <= keepRecent) return null;
+  const cut = starts[starts.length - keepRecent]!;
+  return cut > 3 ? cut : null;
+}
+
+/** The conversation as a plain transcript for the summary request, with long outputs cut. */
+export function transcriptFor(messages: ChatMessage[], perOutput = 2_000): string {
+  const out: string[] = [];
+  for (const m of messages) {
+    if (m.role === 'assistant') {
+      if (m.content) out.push(`AGENT: ${m.content}`);
+      for (const c of m.tool_calls ?? []) out.push(`AGENT RAN ${c.function.name} ${c.function.arguments.slice(0, 400)} [call ${c.id}]`);
+    } else if (m.role === 'tool') {
+      out.push(`RESULT [call ${m.tool_call_id}]: ${m.content.length > perOutput ? `${m.content.slice(0, perOutput / 2)}\n…\n${m.content.slice(-perOutput / 2)}` : m.content}`);
+    } else if (m.role === 'user') {
+      out.push(`OPERATOR: ${typeof m.content === 'string' ? m.content : m.content.map((p) => (p.type === 'text' ? p.text : '[image]')).join(' ')}`);
+    }
+  }
+  return out.join('\n');
+}
+
+export const COMPACTION_PROMPT =
+  'You are summarising your own investigation so far, so you can continue it with less context. ' +
+  'Write a compact, factual summary for yourself, with these headings: Task; What I checked (each command or query and ' +
+  'the result that mattered, with the numbers); Ruled out; Current hypothesis; Still to check. Keep the call ids of ' +
+  'results you may need again (they can be read in full with read_output). Do not invent anything, do not give ' +
+  'instructions, and do not repeat raw output. At most 600 words.';
+
+/** Level one only: elide old large outputs on the wire. */
+export function elideOldOutputs(messages: ChatMessage[], budgetTokens = DEFAULT_CONTEXT_TOKENS): { messages: ChatMessage[]; elided: number; total: number } {
+  let total = estimateTokens(messages);
+  if (total <= budgetTokens) return { messages, elided: 0, total };
+  const toolIdx = messages.map((m, i) => (m.role === 'tool' ? i : -1)).filter((i) => i >= 0);
+  const candidates = toolIdx.slice(0, Math.max(0, toolIdx.length - KEEP_RECENT));
+  const out = [...messages];
+  let elided = 0;
+  for (const i of candidates) {
+    if (total <= budgetTokens) break;
+    const m = out[i]!;
+    if (m.role !== 'tool' || m.content.length <= MIN_ELIDE_CHARS) continue;
+    const note = elide(m.content, m.tool_call_id);
+    total -= Math.ceil((m.content.length - note.length) / 3.5);
+    out[i] = { ...m, content: note };
+    elided += 1;
+  }
+  return { messages: out, elided, total };
 }
 
 export function fitToContext(messages: ChatMessage[], budgetTokens = DEFAULT_CONTEXT_TOKENS): { messages: ChatMessage[]; elided: number } {
@@ -60,7 +118,7 @@ export function fitToContext(messages: ChatMessage[], budgetTokens = DEFAULT_CON
     if (total <= budgetTokens) break;
     const m = out[i]!;
     if (m.role !== 'tool' || m.content.length <= MIN_ELIDE_CHARS) continue;
-    const note = elide(m.content);
+    const note = elide(m.content, m.tool_call_id);
     total -= Math.ceil((m.content.length - note.length) / 3.5);
     out[i] = { ...m, content: note };
     elided += 1;

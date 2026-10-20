@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { Db, KnowledgeScope } from '@supops/db';
 import { knowledgeDocs } from '@supops/db';
+import { alertsMatched, type AlertLike } from './alert-match.ts';
 
 /**
  * What the agent is told from the project's knowledge at the start of a run.
@@ -70,9 +71,11 @@ export function searchKnowledge(db: Db, projectId: string, text: string, limit =
 
 const clip = (s: string, n: number) => (s.length <= n ? s : `${s.slice(0, n - 1).trimEnd()}…`);
 
+const wildcards = (spec: string) => (spec.match(/[*~]/g) ?? []).length;
+
 export interface KnowledgeContext {
   block: string;
-  used: Array<{ docId: string; via: 'pinned' | 'matched' | 'runbook' }>;
+  used: Array<{ docId: string; via: 'pinned' | 'matched' | 'runbook' | 'alert' }>;
 }
 
 export function buildKnowledgeContext(
@@ -81,7 +84,7 @@ export function buildKnowledgeContext(
    * `scope: 'all'` is for advisory runs: there are no targets to scope by, and a
    * runbook written for one machine is still the best guide to the problem described.
    */
-  i: { projectId: string; scope: RunScope | 'all'; task: string; runbookId?: string | null },
+  i: { projectId: string; scope: RunScope | 'all'; task: string; runbookId?: string | null; alerts?: AlertLike[] },
 ): KnowledgeContext {
   const used: KnowledgeContext['used'] = [];
   const parts: string[] = [];
@@ -94,11 +97,31 @@ export function buildKnowledgeContext(
     .all()
     .filter((d) => scope === 'all' || scopeMatches(d.scope, scope));
 
-  // A runbook the operator chose: its full text, regardless of the search.
-  const runbook = i.runbookId ? approved.find((d) => d.id === i.runbookId && d.kind === 'runbook') : undefined;
+  // A runbook the operator chose: its full text, regardless of the search. Without
+  // one, the runbook written for these alerts (the one matching the most of them).
+  const chosen = i.runbookId ? approved.find((d) => d.id === i.runbookId && d.kind === 'runbook') : undefined;
+  const forAlerts = i.alerts?.length
+    ? approved
+        .filter((d) => d.kind === 'runbook' && d.alertMatch)
+        .map((d) => ({ d, n: alertsMatched(d.alertMatch, i.alerts!) }))
+        .filter((x) => x.n > 0)
+        // Most alerts matched first; on a tie, the more specific (fewer wildcards) wins.
+        .sort((a, b) => b.n - a.n || wildcards(a.d.alertMatch!) - wildcards(b.d.alertMatch!) || a.d.slug.localeCompare(b.d.slug))
+        .map((x) => x.d)
+    : [];
+  const runbook = chosen ?? forAlerts[0];
   if (runbook) {
-    parts.push(`RUNBOOK TO FOLLOW: ${runbook.title} [${runbook.slug}]\n${clip(runbook.body, RUNBOOK_CHARS)}\nFollow it step by step and say where and why you deviate.`);
-    used.push({ docId: runbook.id, via: 'runbook' });
+    parts.push(
+      `${chosen ? 'RUNBOOK TO FOLLOW' : 'RUNBOOK FOR THESE ALERTS'}: ${runbook.title} [${runbook.slug}]\n${clip(runbook.body, RUNBOOK_CHARS)}\n` +
+        'Follow it step by step and say where and why you deviate. End your answer with a "### Runbook" section: each step by number, ' +
+        'marked followed, skipped or changed, with why for any not followed as written.',
+    );
+    used.push({ docId: runbook.id, via: chosen ? 'runbook' : 'alert' });
+  }
+  const alsoForAlerts = forAlerts.filter((d) => d.id !== runbook?.id).slice(0, 4);
+  if (alsoForAlerts.length) {
+    parts.push(`Other runbooks written for these alerts (read with read_knowledge if they fit better):\n${alsoForAlerts.map((d) => `- ${d.title} [${d.slug}]`).join('\n')}`);
+    for (const d of alsoForAlerts) used.push({ docId: d.id, via: 'matched' });
   }
 
   let budget = PINNED_CHARS;

@@ -145,7 +145,7 @@ export function Investigate() {
     <>
       <PageHeader title="Investigate" subtitle="Tell it what's wrong. It digs through the evidence and figures out why." />
 
-      <div className="mx-auto max-w-3xl space-y-4 p-6">
+      <div className="mx-auto w-full max-w-3xl space-y-4 p-6">
         <Panel className="p-4">
           <div className="space-y-4">
             {noTargets ? (
