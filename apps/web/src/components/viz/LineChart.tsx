@@ -67,6 +67,7 @@ export function LineChart({
   className,
   empty = 'No samples yet',
   highlight,
+  markers,
 }: {
   series: ChartSeries[];
   unit: string;
@@ -80,6 +81,8 @@ export function LineChart({
   empty?: string;
   /** Pick out one series: the others fade. */
   highlight?: string | null;
+  /** Moments to mark with a vertical line, e.g. deploys; outside the data, not drawn. */
+  markers?: Array<{ at: number; label: string; tone?: 'bad' }>;
 }) {
   const [hover, setHover] = useState<number | null>(null);
   // The plot's real width: how many time labels fit, and how long the forecast's label can be.
@@ -248,6 +251,12 @@ export function LineChart({
         {limit !== undefined && limit !== null && limit >= lo && limit <= hi && (
           <line x1={0} x2={W} y1={y(limit)} y2={y(limit)} stroke="rgb(var(--red))" strokeOpacity={0.6} strokeDasharray="4 4" strokeWidth={1} vectorEffect="non-scaling-stroke" />
         )}
+        {markers?.filter((m) => m.at >= t0 && m.at <= t1).map((m) => (
+          <g key={`m${m.at}${m.label}`}>
+            <title>{m.label}</title>
+            <line x1={x(m.at)} x2={x(m.at)} y1={0} y2={H} stroke={m.tone === 'bad' ? 'rgb(var(--red))' : 'rgb(var(--violet))'} strokeOpacity={0.8} strokeDasharray="3 3" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+          </g>
+        ))}
         {/* The picked-out line is drawn last, on top of the rest. */}
         {series.map((s, i) => [s, i] as const).sort((a, b) => Number(a[0].key === highlight) - Number(b[0].key === highlight)).map(([s, i]) => (
           <polyline

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { clsx } from 'clsx';
 import { Bell, ExternalLink, Search, X } from 'lucide-react';
@@ -9,15 +9,77 @@ import { SEVERITY_STYLE, timeAgo } from '../lib/format';
 import { PageHeader } from '../components/Layout';
 import { Empty, Panel, Segmented, Spinner } from '../components/ui';
 
-const SOURCE_LABEL: Record<string, string> = { alertmanager: 'Alertmanager', prometheus: 'Prometheus', grafana: 'Grafana', supops: 'SupOps forecast', slack: 'Slack' };
 import type { Alert, AlertList, Run } from '../lib/types';
+import { useLivePoll } from '../lib/live';
+import { AlertSources } from '../components/alerts/AlertSources';
+import { MaintenanceWindows } from '../components/alerts/MaintenanceWindows';
+import { CorrelationRules } from '../components/alerts/CorrelationRules';
+import { ExtractionRules } from '../components/alerts/ExtractionRules';
+
+const SOURCE_LABEL: Record<string, string> = {
+  alertmanager: 'Alertmanager',
+  prometheus: 'Prometheus',
+  grafana: 'Grafana',
+  supops: 'SupOps forecast',
+  slack: 'Slack',
+  pagerduty: 'PagerDuty',
+  opsgenie: 'Opsgenie',
+  webhook: 'Webhook',
+};
+
+type Tab = 'alerts' | 'sources' | 'maintenance' | 'rules' | 'labels';
+
+const SECTIONS: Array<{ value: Tab; label: string }> = [
+  { value: 'alerts', label: 'Alerts' },
+  { value: 'sources', label: 'Sources' },
+  { value: 'maintenance', label: 'Maintenance' },
+  { value: 'rules', label: 'Grouping' },
+  { value: 'labels', label: 'Labels' },
+];
 
 export function Alerts() {
+  const projectId = useApp((s) => s.projectId);
+  const isAdmin = useApp((s) => s.user?.globalRole === 'owner' || s.user?.globalRole === 'admin');
+  const [params, setParams] = useSearchParams();
+  const tab = (params.get('tab') as Tab) || 'alerts';
+  const go = (t: Tab) => setParams(t === 'alerts' ? {} : { tab: t }, { replace: true });
+
+  return (
+    <>
+      <PageHeader
+        title="Alerts"
+        subtitle="Every alert gets a read-only diagnosis as it arrives, like a health scan. Investigate starts the fix from it, and every change waits for your approval."
+      />
+      <div className="space-y-4 p-6">
+        {/* Five sections do not fit a phone's width: a menu there, tabs from tablet width up. */}
+        <select className="input sm:hidden" value={tab} aria-label="Section" onChange={(e) => go(e.target.value as Tab)}>
+          {SECTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <div className="hidden sm:block">
+          <Segmented label="Section" value={tab} onChange={go} options={SECTIONS} />
+        </div>
+        {tab === 'sources' && projectId ? (
+          <AlertSources projectId={projectId} isAdmin={isAdmin} />
+        ) : tab === 'maintenance' && projectId ? (
+          <MaintenanceWindows projectId={projectId} />
+        ) : tab === 'rules' && projectId ? (
+          <CorrelationRules projectId={projectId} isAdmin={isAdmin} />
+        ) : tab === 'labels' && projectId ? (
+          <ExtractionRules projectId={projectId} isAdmin={isAdmin} />
+        ) : (
+          <AlertFeed />
+        )}
+      </div>
+    </>
+  );
+}
+
+function AlertFeed() {
   const projectId = useApp((s) => s.projectId);
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [channel, setChannel] = useState<string | null>(null);
-  const [view, setView] = useState<'new' | 'investigating' | 'resolved'>('new');
+  const [view, setView] = useState<'new' | 'investigating' | 'resolved' | 'maintenance'>('new');
 
   const q = new URLSearchParams({ projectId: projectId ?? '', status: view });
   if (channel) q.set('channel', channel);
@@ -26,7 +88,7 @@ export function Alerts() {
     queryKey: ['alerts', projectId, channel, view],
     queryFn: () => api<AlertList>(`/alerts?${q.toString()}`),
     enabled: !!projectId,
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
   });
 
   const invalidate = () => {
@@ -50,12 +112,7 @@ export function Alerts() {
 
   return (
     <>
-      <PageHeader
-        title="Alerts"
-        subtitle="Every alert gets a read-only diagnosis as it arrives, like a health scan. Investigate starts the fix from it, and every change waits for your approval."
-      />
-
-      <div className="space-y-4 p-6">
+      <div className="space-y-4">
         <Segmented
           label="Show"
           value={view}
@@ -64,6 +121,9 @@ export function Alerts() {
             { value: 'new', label: `New${list.data?.statusCounts.new ? ` ${list.data.statusCounts.new}` : ''}` },
             { value: 'investigating', label: 'Investigating' },
             { value: 'resolved', label: 'Resolved' },
+            ...(list.data?.statusCounts.maintenance || view === 'maintenance'
+              ? [{ value: 'maintenance' as const, label: `In maintenance${list.data?.statusCounts.maintenance ? ` ${list.data.statusCounts.maintenance}` : ''}` }]
+              : []),
           ]}
         />
         {channels.length > 0 && (
@@ -107,14 +167,14 @@ export function Alerts() {
                   busy={investigate.isPending && investigate.variables === a.id}
                   onInvestigate={() => investigate.mutate(a.id)}
                   onIgnore={() => ignore.mutate(a.id)}
-                  actions={view === 'new'}
+                  actions={view === 'new' || view === 'maintenance'}
                 />
               ))}
             </ul>
           ) : (
             <Empty
               icon={<Bell size={26} />}
-              title={view === 'new' ? 'No new alerts' : view === 'investigating' ? 'Nothing being investigated' : 'No resolved alerts'}
+              title={view === 'new' ? 'No new alerts' : view === 'investigating' ? 'Nothing being investigated' : view === 'maintenance' ? 'Nothing held by maintenance' : 'No resolved alerts'}
               hint={view === 'resolved' ? 'Resolved alerts are kept for 15 days.' : 'New alerts appear here as they fire, and are grouped into incidents on the Observability page.'}
             />
           )}
@@ -154,10 +214,20 @@ function AlertRow({
           {alert.count > 1 && (
             <span className="tabular rounded border border-edge px-1.5 py-px text-[10px] text-muted">×{alert.count}</span>
           )}
+          {alert.maintenanceName && !alert.incidentId && (
+            <span className="chip border border-blue/40 bg-blue/10 text-blue-text" title="Held by a maintenance window: no incident or diagnosis until it ends.">
+              In maintenance: {alert.maintenanceName}
+            </span>
+          )}
+          {alert.flapping && (
+            <span className="chip border border-amber/40 bg-amber/10 text-amber" title="Firing and resolving over and over. It stays one incident, and is diagnosed once it settles.">
+              Flapping
+            </span>
+          )}
         </div>
 
         <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-muted">
-          <span>{alert.channelName ? <span className="font-mono text-cyan">{alert.channelName}</span> : SOURCE_LABEL[alert.source] ?? alert.source}</span>
+          <span>{alert.channelName ? <span className="font-mono text-cyan">{alert.channelName}</span> : alert.sourceName ?? SOURCE_LABEL[alert.source] ?? alert.source}</span>
           {alert.labels?.instance && <><span aria-hidden>·</span><span className="font-mono">{alert.labels.instance}</span></>}
           <span aria-hidden>·</span>
           <span className="whitespace-nowrap">{timeAgo(alert.lastSeenAt)}</span>

@@ -11,6 +11,9 @@ import { SlackPanel } from '../components/SlackPanel';
 import { StoragePanel } from '../components/StoragePanel';
 import { ObservabilityPanel } from '../components/ObservabilityPanel';
 import { AutonomyPanel } from '../components/AutonomyPanel';
+import { NotificationsPanel } from '../components/NotificationsPanel';
+import { McpPanel } from '../components/McpPanel';
+import { ApiKeysPanel } from '../components/ApiKeysPanel';
 import type { Project } from '../lib/types';
 
 interface DeleteImpact {
@@ -153,7 +156,7 @@ export function Settings() {
     <>
       <PageHeader title="Settings" subtitle="Pick which model to use, and set the guardrails for this project" />
 
-      <div className="mx-auto max-w-3xl space-y-4 p-6">
+      <div className="mx-auto w-full max-w-3xl space-y-4 p-6">
         <Panel title="Model provider">
           {!form ? (
             <div className="grid place-items-center py-10 text-muted"><Spinner /></div>
@@ -303,11 +306,17 @@ export function Settings() {
 
         {projectId && <SlackPanel projectId={projectId} />}
 
+        {projectId && <NotificationsPanel projectId={projectId} isAdmin={canDelete} />}
+
+        {projectId && <McpPanel projectId={projectId} isAdmin={canDelete} />}
+
         {project && <AutonomyPanel project={project} canEdit={canDelete} />}
 
         <ObservabilityPanel canEdit={canDelete} />
 
         <StoragePanel canEdit={canDelete} />
+
+        {canDelete && <ApiKeysPanel />}
 
         <Panel title="Kill switch" accent="bg-red">
           <div className="flex items-start gap-4 p-4">

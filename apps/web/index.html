@@ -13,17 +13,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="SupOps" />
     <title>SupOps</title>
-    <script>
-      // Launched as the installed app? Then play the logo intro. Set before first paint
-      // so a browser tab never flashes it. main.tsx dismisses it once the app is up.
-      try {
-        if (matchMedia('(display-mode: standalone)').matches ||
-            matchMedia('(display-mode: window-controls-overlay)').matches ||
-            navigator.standalone === true) {
-          document.documentElement.classList.add('pwa-launch');
-        }
-      } catch (e) {}
-    </script>
+    <script src="/pwa-launch.js"></script>
     <style>
       #splash { display: none; }
       .pwa-launch #splash {

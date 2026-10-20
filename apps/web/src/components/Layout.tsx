@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { PageErrorBoundary } from './PageErrorBoundary';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { clsx } from 'clsx';
 import {
-  Bell, BookOpen, ChevronDown, Download, ChevronLeft, ChevronRight, ChevronsUpDown, Headset, HeartPulse, LayoutDashboard, LogOut, Play, Plus, Server, Settings as SettingsIcon, ShieldCheck, Sparkles, Terminal, TerminalSquare, Users as UsersIcon,
+  Bell, BookOpen, Boxes, Brain, ChevronDown, Download, ChevronLeft, ChevronRight, ChevronsUpDown, Gauge, Globe, Headset, HeartPulse, LayoutDashboard, LogOut, Play, Plus, Server, Settings as SettingsIcon, ShieldCheck, Sparkles, Terminal, TerminalSquare, Users as UsersIcon, Workflow as WorkflowIcon,
 } from 'lucide-react';
 import { useInstall } from '../lib/pwa';
 import { ObservabilityIcon } from './icons/ObservabilityIcon';
@@ -13,6 +13,7 @@ import { NewProjectDialog } from './NewProjectDialog';
 import { api } from '../lib/api';
 import { SIDEBAR_BREAKPOINT, useApp } from '../lib/store';
 import type { PendingApproval, Project } from '../lib/types';
+import { useLivePoll, useLiveUpdates } from '../lib/live';
 
 interface NavItem {
   to: string;
@@ -39,6 +40,9 @@ const GROUPS: Array<{ label: string; items: NavItem[] }> = [
     label: 'Operations',
     items: [
       { to: '/observability', label: 'Observability', icon: ObservabilityIcon, badge: 'incidents' },
+      { to: '/services', label: 'Services', icon: Boxes },
+      { to: '/slos', label: 'SLOs', icon: Gauge },
+      { to: '/synthetics', label: 'Synthetics', icon: Globe },
       { to: '/health', label: 'Health', icon: HeartPulse, badge: 'health' },
       { to: '/alerts', label: 'Alerts', icon: Bell, badge: 'alerts' },
       { to: '/runs', label: 'Runs', icon: Play },
@@ -51,6 +55,8 @@ const GROUPS: Array<{ label: string; items: NavItem[] }> = [
       { to: '/targets', label: 'Targets', icon: Server },
       { to: '/agents', label: 'Agents', icon: Sparkles },
       { to: '/knowledge', label: 'Knowledge', icon: BookOpen },
+      { to: '/workflows', label: 'Workflows', icon: WorkflowIcon },
+      { to: '/learning', label: 'Learning', icon: Brain },
       { to: '/users', label: 'Users', icon: UsersIcon, adminOnly: true },
       { to: '/settings', label: 'Settings', icon: SettingsIcon },
     ],
@@ -63,6 +69,8 @@ export function Layout() {
   const location = useLocation();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
+  // One push channel for the whole app: pages refetch when their data changes.
+  useLiveUpdates(useQueryClient());
 
   /**
    * Force the rail shut below the breakpoint. `remember: false` so being collapsed by
@@ -90,7 +98,7 @@ export function Layout() {
     queryKey: ['approvals', projectId],
     queryFn: () => api<PendingApproval[]>(`/runs/approvals/pending?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
   });
 
   const active = projects.data?.find((p) => p.id === projectId) ?? projects.data?.[0];
@@ -100,21 +108,21 @@ export function Layout() {
     queryKey: ['alertCount', projectId],
     queryFn: () => api<{ new: number }>(`/alerts/count?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
   });
 
   const healthCount = useQuery({
     queryKey: ['healthCount', projectId],
     queryFn: () => api<{ open: number }>(`/health/count?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
   });
 
   const incidentCount = useQuery({
     queryKey: ['incidentCount', projectId],
     queryFn: () => api<{ open: number }>(`/observability/count?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 10_000,
+    refetchInterval: useLivePoll(10_000),
   });
 
   const badges = {
@@ -312,7 +320,9 @@ export function Layout() {
 
       <main className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         <PageErrorBoundary key={location.pathname}>
-          <Outlet />
+          <Suspense fallback={<PageLoading />}>
+            <Outlet />
+          </Suspense>
         </PageErrorBoundary>
       </main>
 
@@ -378,5 +388,17 @@ export function PageHeader({
       </div>
       {action}
     </header>
+  );
+}
+
+/**
+ * Shown while a page's code downloads. Invisible for the first moments, so a fast
+ * load never flashes a spinner; only a slow link sees it.
+ */
+function PageLoading() {
+  return (
+    <div className="page-loading grid min-h-[40vh] place-items-center" role="status" aria-label="Loading page">
+      <div className="h-6 w-6 animate-spin rounded-full border-2 border-edge border-t-blue" />
+    </div>
   );
 }

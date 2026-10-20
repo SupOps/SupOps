@@ -16,6 +16,7 @@ import {
 } from '../components/viz';
 import type { Agent, DashboardData, HealthOverview, PendingApproval, Run, Target } from '../lib/types';
 import { topLevelTargets } from '../lib/types';
+import { useLivePoll } from '../lib/live';
 
 const ENV_ORDER = ['prod', 'staging', 'dev'];
 
@@ -30,13 +31,13 @@ export function Dashboard() {
   const stats = useQuery({
     queryKey: ['dashboard', projectId],
     queryFn: () => api<DashboardData>(`/dashboard?projectId=${projectId}`),
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
     ...on,
   });
   const runs = useQuery({
     queryKey: ['runs', projectId],
     queryFn: () => api<Run[]>(`/runs?projectId=${projectId}`),
-    refetchInterval: 4000,
+    refetchInterval: useLivePoll(4000),
     ...on,
   });
   const targets = useQuery({
@@ -53,12 +54,12 @@ export function Dashboard() {
     queryKey: ['approvals', projectId],
     queryFn: () => api<PendingApproval[]>(`/runs/approvals/pending?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
   });
   const health = useQuery({
     queryKey: ['health', projectId],
     queryFn: () => api<HealthOverview>(`/health/overview?projectId=${projectId}`),
-    refetchInterval: 5000,
+    refetchInterval: useLivePoll(5000),
     ...on,
   });
 

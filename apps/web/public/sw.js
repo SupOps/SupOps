@@ -10,8 +10,8 @@
  * - Page loads are network-first, falling back to the cached app shell when the
  *   server is unreachable, so the window still opens and says it is offline.
  */
-const VERSION = 'supops-v1';
-const SHELL = ['/', '/manifest.webmanifest', '/brand-mark.png', '/icon-192.png', '/icon-512.png'];
+const VERSION = 'supops-v2';
+const SHELL = ['/', '/pwa-launch.js', '/manifest.webmanifest', '/brand-mark.png', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

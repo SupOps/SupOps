@@ -4,7 +4,7 @@ import { patch, post } from '../lib/api';
 import { Field, Panel, Segmented, Spinner, Switch } from './ui';
 import type { Target } from '../lib/types';
 
-type Kind = 'prometheus' | 'alertmanager' | 'loki' | 'elasticsearch' | 'grafana';
+type Kind = 'prometheus' | 'alertmanager' | 'loki' | 'elasticsearch' | 'grafana' | 'tempo' | 'jaeger' | 'signoz' | 'github' | 'gitlab';
 type AuthType = 'none' | 'bearer' | 'basic';
 
 const KINDS: Array<{ value: Kind; label: string; hint: string; placeholder: string }> = [
@@ -13,7 +13,13 @@ const KINDS: Array<{ value: Kind; label: string; hint: string; placeholder: stri
   { value: 'loki', label: 'Loki', hint: 'Logs via LogQL.', placeholder: 'https://loki.internal:3100' },
   { value: 'elasticsearch', label: 'Elasticsearch', hint: 'Logs via Lucene query syntax (Elasticsearch or OpenSearch).', placeholder: 'https://es.internal:9200' },
   { value: 'grafana', label: 'Grafana', hint: 'PromQL through a Grafana Prometheus datasource (use a Viewer service-account token).', placeholder: 'https://grafana.internal' },
+  { value: 'tempo', label: 'Tempo', hint: 'Traces: search by service, duration, errors or TraceQL, and read one trace as a summary.', placeholder: 'https://tempo.internal:3200' },
+  { value: 'signoz', label: 'SigNoz', hint: 'Traces through the SigNoz query API (v5). Use a service account API key as the bearer token; it is sent as SIGNOZ-API-KEY.', placeholder: 'https://signoz.internal:8080' },
+  { value: 'jaeger', label: 'Jaeger', hint: 'Traces through the Jaeger query API (the UI address, e.g. port 16686).', placeholder: 'https://jaeger.internal:16686' },
+  { value: 'github', label: 'GitHub', hint: 'CI runs and why they failed, pull requests with checks and changed files, commits, files, releases. Read-only, only for the repositories listed. Use a fine-grained token with read access to Actions, Contents and Pull requests.', placeholder: 'https://api.github.com' },
+  { value: 'gitlab', label: 'GitLab', hint: 'Pipelines and failed job logs, merge requests, commits, files, releases. Read-only, only for the projects listed. Use a token with the read_api scope.', placeholder: 'https://gitlab.com' },
 ];
+const isScm = (k: Kind) => k === 'github' || k === 'gitlab';
 
 /**
  * Add or edit an observability connection. These are read-only to the agent: it can
@@ -23,7 +29,7 @@ const KINDS: Array<{ value: Kind; label: string; hint: string; placeholder: stri
 export function ConnectionForm({ projectId, existing, onDone }: { projectId: string; existing?: Target; onDone: () => void }) {
   const qc = useQueryClient();
   const isEdit = !!existing;
-  const cfg = (existing?.config ?? {}) as { kind?: Kind; baseUrl?: string; allowPrivateNetwork?: boolean; insecureSkipVerify?: boolean; tenantId?: string; indices?: string[]; datasourceUid?: string; ingestAlerts?: boolean; watch?: boolean };
+  const cfg = (existing?.config ?? {}) as { kind?: Kind; baseUrl?: string; allowPrivateNetwork?: boolean; insecureSkipVerify?: boolean; tenantId?: string; indices?: string[]; datasourceUid?: string; ingestAlerts?: boolean; watch?: boolean; repos?: string[] };
   const [kind, setKind] = useState<Kind>(cfg.kind ?? 'prometheus');
   const [form, setForm] = useState({
     slug: existing?.slug ?? '',
@@ -36,6 +42,7 @@ export function ConnectionForm({ projectId, existing, onDone }: { projectId: str
     tenantId: cfg.tenantId ?? '',
     indices: (cfg.indices ?? []).join(', '),
     datasourceUid: cfg.datasourceUid ?? '',
+    repos: (cfg.repos ?? []).join(', '),
     // Unset means the default: Alertmanager alerts are read, metrics are watched.
     ingestAlerts: cfg.ingestAlerts as boolean | undefined,
     watch: cfg.watch ?? true,
@@ -62,9 +69,10 @@ export function ConnectionForm({ projectId, existing, onDone }: { projectId: str
         baseUrl: form.baseUrl.trim(),
         allowPrivateNetwork: form.allowPrivateNetwork,
         ...(form.insecureSkipVerify ? { insecureSkipVerify: true } : {}),
-        ...(kind === 'loki' && form.tenantId.trim() ? { tenantId: form.tenantId.trim() } : {}),
+        ...((kind === 'loki' || kind === 'tempo') && form.tenantId.trim() ? { tenantId: form.tenantId.trim() } : {}),
         ...(kind === 'elasticsearch' ? { indices: form.indices.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean) } : {}),
         ...(kind === 'grafana' && form.datasourceUid.trim() ? { datasourceUid: form.datasourceUid.trim() } : {}),
+        ...(isScm(kind) ? { repos: form.repos.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean) } : {}),
         ...(canIngest ? { ingestAlerts: ingest } : {}),
         ...(canWatch ? { watch: form.watch } : {}),
       };
@@ -87,11 +95,14 @@ export function ConnectionForm({ projectId, existing, onDone }: { projectId: str
   });
 
   return (
-    <Panel title={isEdit ? `Edit ${existing.slug}` : 'Add an observability connection'} accent="bg-cyan" className="p-4">
+    <Panel title={isEdit ? `Edit ${existing.slug}` : 'Add a connection (observability, GitHub or GitLab)'} accent="bg-cyan" className="p-4">
       <div className="space-y-4 px-1 pb-1">
         {!isEdit && (
           <div>
-            <Segmented label="Connection type" value={kind} onChange={setKind} options={KINDS.map((k) => ({ value: k.value, label: k.label }))} />
+            <label className="label" htmlFor="connection-kind">Connection type</label>
+            <select id="connection-kind" className="input w-full sm:w-64" value={kind} onChange={(e) => { const k = e.target.value as Kind; setKind(k); if (isScm(k)) setAuthType('bearer'); }}>
+              {KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+            </select>
             <p className="mt-1.5 text-[11px] text-muted">{meta.hint} The agent can only read from it.</p>
           </div>
         )}
@@ -110,8 +121,13 @@ export function ConnectionForm({ projectId, existing, onDone }: { projectId: str
             </select>
           </Field>
           <Field label="API URL"><input className="input font-mono" value={form.baseUrl} placeholder={meta.placeholder} onChange={set('baseUrl')} /></Field>
-          {kind === 'loki' && <Field label="Tenant (X-Scope-OrgID, optional)"><input className="input" value={form.tenantId} onChange={set('tenantId')} /></Field>}
+          {(kind === 'loki' || kind === 'tempo') && <Field label="Tenant (X-Scope-OrgID, optional)"><input className="input" value={form.tenantId} onChange={set('tenantId')} /></Field>}
           {kind === 'grafana' && <Field label="Prometheus datasource uid"><input className="input font-mono" value={form.datasourceUid} placeholder="e.g. P1809F7CD0C75ACF3" onChange={set('datasourceUid')} /></Field>}
+          {isScm(kind) && (
+            <Field label={kind === 'github' ? 'Repositories it may read (owner/name; * allowed)' : 'Projects it may read (group/project; * allowed)'}>
+              <input className="input font-mono" value={form.repos} placeholder={kind === 'github' ? 'acme/shop, acme/infra-*' : 'platform/api, platform/*'} onChange={set('repos')} />
+            </Field>
+          )}
           {kind === 'elasticsearch' && <Field label="Allowed index patterns (blank = any)"><input className="input font-mono" value={form.indices} placeholder="logs-*, app-*" onChange={set('indices')} /></Field>}
           <Field label="Description (helps the agent pick it)"><input className="input" value={form.description} onChange={set('description')} /></Field>
         </div>
@@ -155,7 +171,7 @@ export function ConnectionForm({ projectId, existing, onDone }: { projectId: str
                 label="Authentication"
                 value={authType}
                 onChange={setAuthType}
-                options={[{ value: 'none', label: 'None' }, { value: 'bearer', label: 'Bearer token' }, { value: 'basic', label: 'Username & password' }]}
+                options={isScm(kind) ? [{ value: 'bearer', label: 'Token' }] : [{ value: 'none', label: 'None' }, { value: 'bearer', label: 'Bearer token' }, { value: 'basic', label: 'Username & password' }]}
               />
               {authType === 'bearer' && <input className="input font-mono" type="password" placeholder="token" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" />}
               {authType === 'basic' && (
@@ -173,7 +189,7 @@ export function ConnectionForm({ projectId, existing, onDone }: { projectId: str
         <div className="flex gap-2">
           <button
             className="btn-primary"
-            disabled={save.isPending || !form.baseUrl.trim() || (!isEdit && !form.slug)}
+            disabled={save.isPending || !form.baseUrl.trim() || (!isEdit && !form.slug) || (isScm(kind) && !form.repos.trim())}
             onClick={() => save.mutate()}
           >
             {save.isPending ? <Spinner /> : null} {isEdit ? 'Save' : 'Add connection'}

@@ -96,6 +96,30 @@ export function Empty({
   );
 }
 
+/**
+ * What a tool call runs, as an approver should read it. A script shows as the script
+ * itself, with the interpreter and time limit above it, rather than as one long
+ * quoted `bash -c '...'` line.
+ */
+export function CallCommand({ call, className }: { call: { toolKey: string; argsJson: Record<string, unknown>; renderedCommand: string | null }; className?: string }) {
+  const a = call.argsJson;
+  if (call.toolKey === 'run_script' && typeof a.script === 'string') {
+    const interpreter = typeof a.interpreter === 'string' ? a.interpreter : 'bash';
+    // Whatever wraps the script (sudo, a jump host) comes before its `timeout`.
+    const at = call.renderedCommand?.indexOf('timeout ') ?? -1;
+    const elevated = at > 0 ? call.renderedCommand!.slice(0, at).trim() : '';
+    return (
+      <div className={className}>
+        <p className="mb-1 text-[11px] text-muted">
+          {interpreter} script · stops after {typeof a.timeout_seconds === 'number' ? a.timeout_seconds : 120} s{elevated ? <> · runs as <span className="font-mono">{elevated}</span></> : null}
+        </p>
+        <CommandBlock>{a.script}</CommandBlock>
+      </div>
+    );
+  }
+  return <CommandBlock className={className}>{call.renderedCommand ?? JSON.stringify(a)}</CommandBlock>;
+}
+
 export function CommandBlock({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <pre
@@ -186,7 +210,8 @@ export function Segmented<T extends string>({
   disabled?: boolean;
 }) {
   return (
-    <div role="radiogroup" aria-label={label} className={clsx('inline-flex rounded-full border border-edge bg-tile-2 p-0.5', disabled && 'opacity-50')}>
+    // Scrolls sideways rather than overflowing when there are more options than room (phones).
+    <div role="radiogroup" aria-label={label} className={clsx('inline-flex max-w-full overflow-x-auto rounded-full border border-edge bg-tile-2 p-0.5 [scrollbar-width:none]', disabled && 'opacity-50')}>
       {options.map((o) => {
         const on = o.value === value;
         return (
@@ -198,7 +223,7 @@ export function Segmented<T extends string>({
             disabled={disabled}
             onClick={() => onChange(o.value)}
             className={clsx(
-              'rounded-full px-3 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue/50',
+              'shrink-0 whitespace-nowrap rounded-full px-3 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue/50',
               on ? o.active ?? 'bg-blue/20 text-blue-text' : 'text-muted hover:text-ink',
             )}
           >

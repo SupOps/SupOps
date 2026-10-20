@@ -7,9 +7,10 @@ import { api, del, patch, post } from '../lib/api';
 import { useApp } from '../lib/store';
 import { timeAgo } from '../lib/format';
 import { PageHeader } from '../components/Layout';
-import { CommandBlock, Empty, Panel, RiskBadge, Segmented, Spinner } from '../components/ui';
+import { CallCommand, Empty, Panel, RiskBadge, Segmented, Spinner } from '../components/ui';
 import { Approvers } from '../components/Approvers';
 import type { ApprovalHistoryEntry, PendingApproval, TrustedCommand } from '../lib/types';
+import { useLivePoll } from '../lib/live';
 
 type Tab = 'waiting' | 'trusted' | 'history';
 
@@ -37,13 +38,13 @@ export function Approvals() {
     queryKey: ['approvals', projectId],
     queryFn: () => api<PendingApproval[]>(`/runs/approvals/pending?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 4000,
+    refetchInterval: useLivePoll(4000),
   });
   const history = useQuery({
     queryKey: ['approvalHistory', projectId],
     queryFn: () => api<ApprovalHistoryEntry[]>(`/runs/approvals/history?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 8000,
+    refetchInterval: useLivePoll(8000),
   });
 
   return (
@@ -72,7 +73,7 @@ export function Approvals() {
                 <div className="flex-1" />
                 <span className="text-xs text-muted">{run && timeAgo(run.startedAt)}</span>
               </div>
-              <CommandBlock className="mb-3">{toolCall.renderedCommand}</CommandBlock>
+              <CallCommand call={toolCall} className="mb-3" />
               <div className="flex items-center justify-between gap-3">
                 <p className="min-w-0 truncate text-xs text-muted">{run?.title}</p>
                 {/* Decisions are made on the run page, in the context that justifies them. */}

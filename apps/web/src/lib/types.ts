@@ -198,7 +198,7 @@ export interface RunDetail {
   toolCalls: ToolCall[];
   events: Array<{ seq: number; type: string; payload: Record<string, unknown> }>;
   /** Project knowledge the run was given, and how each document was chosen. */
-  knowledge?: Array<{ docId: string; via: 'pinned' | 'matched' | 'runbook'; title: string; kind: string }>;
+  knowledge?: Array<{ docId: string; via: 'pinned' | 'matched' | 'runbook' | 'alert'; title: string; kind: string }>;
 }
 
 export interface PendingApproval {
@@ -247,6 +247,13 @@ export interface Alert {
     runId: string | null;
   } | null;
   slackPermalink: string | null;
+  /** Firing and resolving over and over; its incident's diagnosis waits until it settles. */
+  flapping?: boolean;
+  /** The webhook sender's name, for alerts pushed to SupOps. */
+  sourceName?: string | null;
+  /** The maintenance window muting it: stored, but no incident until the window ends. */
+  maintenanceId?: string | null;
+  maintenanceName?: string | null;
   receivedAt: number | string;
   lastSeenAt: number | string;
 }
@@ -342,11 +349,24 @@ export interface Incident {
   runId: string | null;
   rootCause: string | null;
   confidence: 'high' | 'medium' | 'low' | 'inconclusive' | null;
+  /** What the diagnosis weighed, each cause confirmed, ruled out or untested. */
+  hypotheses?: Array<{ hypothesis: string; verdict: 'confirmed' | 'ruled_out' | 'untested'; evidence: string }> | null;
+  /** What is affected, what was checked and is fine, what was not checked. */
+  blastRadius?: { affected: string | null; healthy: string | null; unchecked: string | null } | null;
   openedAt: string;
   lastSeenAt: string;
   resolvedAt: string | null;
   mergedInto: string | null;
   alertCount?: number;
+  /** Someone is on it; lapses by itself when the incident gets worse. */
+  acknowledgedAt: string | null;
+  acknowledgedByName?: string | null;
+  assigneeId: string | null;
+  assigneeName?: string | null;
+  /** A person set the severity; alerts no longer change it. */
+  severityPinned: boolean;
+  /** Waiting for its rule's threshold: not listed or diagnosed yet. */
+  held?: boolean;
 }
 
 export interface Observation {
@@ -395,9 +415,13 @@ export interface ObservabilitySettings {
   watchIntervalMs: number;
   autoTriage: boolean;
   triageMinSeverity: 'critical' | 'warning' | 'info';
+  triageGatherSeconds: number;
   triageMaxPerHour: number;
   predictWarningHours: number;
   predictCriticalHours: number;
+  flapChanges: number;
+  flapWindowMin: number;
+  slackThreadReplies: boolean;
 }
 
 export interface ObservabilityOverview {
@@ -434,6 +458,10 @@ export interface IncidentDetail {
   };
   timeline: Array<{ at: number; kind: string; text: string }>;
   mergeCandidates: Array<{ id: string; title: string }>;
+  /** Open incidents that may be the same problem, and why. */
+  suggestions?: Array<{ id: string; title: string; reason: string }>;
+  /** The correlation rule that made it, if one did. */
+  rule: { id: string; name: string; threshold: number; resolveOn: 'all' | 'first' | 'never' } | null;
 }
 
 export interface WatchItem {
@@ -461,7 +489,9 @@ export interface Watch {
   builtin: boolean;
   badDirection: 'up' | 'down' | 'both';
   limit: { value: number; when: 'below' | 'above' } | null;
-  group: 'resources' | 'traffic' | 'kubernetes' | 'stack' | 'custom';
+  /** Self-adjusting threshold: limits learned from each series' last 7 days. */
+  adaptive?: { iqrs: number } | null;
+  group: 'resources' | 'traffic' | 'kubernetes' | 'databases' | 'stack' | 'custom';
   enabled: boolean;
   lastRunAt: string | null;
   lastError: string | null;
@@ -520,4 +550,187 @@ export interface TrustedCommand {
   revokedByName: string | null;
   hits: number;
   lastUsedAt: string | null;
+}
+
+export type AlertSourceKind = 'alertmanager' | 'grafana' | 'pagerduty' | 'opsgenie' | 'generic' | 'changes';
+
+export interface GenericMapping {
+  alertsPath?: string;
+  titlePath?: string;
+  severityPath?: string;
+  statusPath?: string;
+  resolvedValues?: string[];
+  fingerprintPath?: string;
+  summaryPath?: string;
+  labelsPath?: string;
+  hostPath?: string;
+  servicePath?: string;
+  linkPath?: string;
+}
+
+/** A sender that pushes alerts to SupOps by webhook. The token itself is never returned after creation. */
+export interface AlertSource {
+  id: string;
+  projectId: string;
+  kind: AlertSourceKind;
+  name: string;
+  tokenPrefix: string;
+  previousTokenUntil: string | number | null;
+  rotating: boolean;
+  mapping: GenericMapping | null;
+  enabled: boolean;
+  createdAt: string | number;
+  received: number;
+  alertsIn: number;
+  repeats: number;
+  rejected: number;
+  lastReceivedAt: string | number | null;
+  lastError: string | null;
+  lastErrorAt: string | number | null;
+  /** Writes acknowledgements, resolves and the diagnosis back to the source. */
+  writeback?: boolean;
+}
+
+export interface MaintenanceWindow {
+  id: string;
+  projectId: string;
+  name: string;
+  reason: string | null;
+  matcherText: string;
+  startsAt: string | number;
+  endsAt: string | number;
+  recurrence: { days: number[]; start: string; end: string; timezone: string } | null;
+  state: 'active' | 'scheduled' | 'waiting' | 'ended' | 'cancelled';
+  alertsMuted: number;
+  createdByName: string | null;
+  cancelledByName: string | null;
+  cancelledAt: string | number | null;
+}
+
+export interface CorrelationRule {
+  id: string;
+  projectId: string;
+  name: string;
+  matcherText: string;
+  groupBy: string[];
+  windowMin: number;
+  threshold: number;
+  resolveOn: 'all' | 'first' | 'never';
+  titleTemplate: string;
+  priority: number;
+  enabled: boolean;
+  incidentsMade: number;
+  alertsGrouped: number;
+  lastMatchedAt: string | number | null;
+}
+
+export interface RulePreview {
+  ok: boolean;
+  error?: string;
+  considered?: number;
+  matched?: number;
+  incidents?: number;
+  held?: number;
+  groups?: Array<{ title: string; alerts: number; visible: boolean; first: number; last: number }>;
+}
+
+export interface ExtractionRuleView {
+  id: string;
+  name: string;
+  matcherText: string;
+  field: 'title' | 'summary' | 'label';
+  labelName: string | null;
+  pattern: string;
+  enabled: boolean;
+  seen: number;
+  applied: number;
+  lastAppliedAt: string | number | null;
+  lastExample: Record<string, string> | null;
+}
+
+export type ChannelKind = 'slack' | 'teams' | 'email' | 'webhook' | 'pagerduty' | 'opsgenie';
+
+export interface NotificationChannel {
+  id: string;
+  kind: ChannelKind;
+  name: string;
+  config: Record<string, unknown>;
+  has: { url: boolean; secret: boolean; password: boolean; routingKey: boolean; apiKey: boolean };
+  enabled: boolean;
+  sent: number;
+  failed: number;
+  lastSentAt: string | number | null;
+  lastError: string | null;
+  lastErrorAt: string | number | null;
+  createdAt: string | number;
+}
+
+export type NotifyEvent = 'opened' | 'escalated' | 'acknowledged' | 'resolved' | 'reopened' | 'diagnosed';
+
+export interface NotificationRoute {
+  id: string;
+  name: string;
+  matcherText: string;
+  minSeverity: 'info' | 'warning' | 'critical';
+  events: NotifyEvent[];
+  channelIds: string[];
+  quietHours: { days: number[]; start: string; end: string; timezone: string } | null;
+  digestHour: number | null;
+  enabled: boolean;
+}
+
+export interface NotificationDelivery {
+  id: string;
+  channelId: string;
+  incidentId: string | null;
+  incidentTitle: string | null;
+  event: string;
+  status: 'pending' | 'sent' | 'failed' | 'skipped';
+  reason: string | null;
+  attempts: number;
+  error: string | null;
+  responseCode: number | null;
+  createdAt: string | number;
+  sentAt: string | number | null;
+}
+
+export type WorkflowTrigger =
+  | { type: 'incident'; on: Array<'opened' | 'escalated' | 'acknowledged' | 'resolved' | 'diagnosed'>; matchers: string; minSeverity: 'info' | 'warning' | 'critical' }
+  | { type: 'schedule'; everyMinutes: number }
+  | { type: 'manual' };
+
+export type WorkflowStep =
+  | { kind: 'notify'; channelIds: string[]; message: string }
+  | { kind: 'diagnose' }
+  | { kind: 'recheck' }
+  | { kind: 'assign'; userId: string | null }
+  | { kind: 'severity'; severity: 'critical' | 'warning' | 'info' }
+  | { kind: 'acknowledge' }
+  | { kind: 'note'; text: string }
+  | { kind: 'wait'; minutes: number }
+  | { kind: 'if'; matchers: string; severityAtLeast: 'info' | 'warning' | 'critical' | null; stillOpen: boolean };
+
+export interface Workflow {
+  id: string;
+  name: string;
+  description: string | null;
+  trigger: WorkflowTrigger;
+  steps: WorkflowStep[];
+  revision: number;
+  enabled: boolean;
+  lastRunAt: string | number | null;
+  updatedAt: string | number;
+}
+
+export interface WorkflowRun {
+  id: string;
+  revision: number;
+  incidentId: string | null;
+  reason: string;
+  status: 'running' | 'waiting' | 'succeeded' | 'failed' | 'stopped';
+  log: Array<{ step: number; at: number; status: 'done' | 'skipped' | 'failed' | 'waiting' | 'stopped'; text: string }>;
+  steps: WorkflowStep[];
+  startedAt: string | number;
+  endedAt: string | number | null;
+  resumeAt: string | number | null;
 }

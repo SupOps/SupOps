@@ -273,3 +273,12 @@ body {
   .tile-interactive:hover,
   .tile-interactive:focus-within { transform: none; }
 }
+
+/* A page still downloading: stays invisible briefly so a fast load never flashes. */
+.page-loading {
+  animation: page-loading-in 0.2s ease 0.35s both;
+}
+@keyframes page-loading-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
