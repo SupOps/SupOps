@@ -1,0 +1,38 @@
+# Runs the detonation sandbox stack on a Docker host, separate from the SupOps server.
+# Point SupOps at it with SUPOPS_DETONATOR_URL=http://<this-host>:7077 (private only).
+# Prefer the gVisor runtime (runsc) for the sandbox; the detonator uses it automatically
+# when present.
+#
+# NOT run in the SupOps dev environment (no Docker there). Build and verify here.
+networks:
+  sinks:
+    name: detonate-sinks
+    internal: true   # the sandbox can reach ONLY the sinks, never the real internet
+volumes:
+  sinklogs:
+services:
+  tcp-sink:
+    image: node:22-bookworm-slim
+    command: node sinks/tcp-sink.mjs
+    working_dir: /app
+    volumes: [ "./:/app:ro", "sinklogs:/sinks" ]
+    networks: [ sinks ]
+    environment: { SINK_LOG_DIR: /sinks }
+  dns-sink:
+    image: node:22-bookworm-slim
+    command: node sinks/dns-sink.mjs
+    working_dir: /app
+    volumes: [ "./:/app:ro", "sinklogs:/sinks" ]
+    networks: [ sinks ]
+    environment: { SINK_LOG_DIR: /sinks, TCP_SINK_IP: "<set to tcp-sink's address on detonate-sinks>" }
+  detonator:
+    build: { context: ., dockerfile: Dockerfile.detonator }
+    ports: [ "127.0.0.1:7077:7077" ]
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"   # owns the socket; SupOps never does
+      - "sinklogs:/sinks:ro"
+    environment:
+      SANDBOX_IMAGE: supops-detonate-sandbox
+      SANDBOX_NETWORK: detonate-sinks
+      SINK_LOG_DIR: /sinks
+      SUPOPS_CANARY_TOKENS: "<the three build-arg tokens, comma-separated>"

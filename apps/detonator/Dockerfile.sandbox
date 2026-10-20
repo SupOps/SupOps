@@ -1,0 +1,40 @@
+# The throwaway image a script is detonated in. It is never reused: one container per
+# script, removed right after. It carries no real secrets -- only CANARIES: fake
+# credential files whose contents are unique markers. If a detonated script reads a
+# canary and its marker then appears on the wire (the TCP/DNS sinks), that is proof of
+# exfiltration. An LD_PRELOAD shim logs when a canary file is opened.
+#
+# Build (on a Docker host):
+#   docker build -f Dockerfile.sandbox -t supops-detonate-sandbox \
+#     --build-arg C1=$(openssl rand -hex 16) --build-arg C2=$(openssl rand -hex 16) --build-arg C3=$(openssl rand -hex 16) .
+# and pass the same three tokens to the detonator as SUPOPS_CANARY_TOKENS=C1,C2,C3.
+FROM debian:stable-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends strace ca-certificates python3 gcc libc6-dev curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Canary markers, injected at build time (unique per deployment).
+ARG C1=canary-unset-1
+ARG C2=canary-unset-2
+ARG C3=canary-unset-3
+
+# Plant the canaries where credential-stealers look.
+RUN mkdir -p /root/.ssh /root/.aws \
+ && printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nCANARY-%s\n-----END OPENSSH PRIVATE KEY-----\n' "$C1" > /root/.ssh/id_rsa \
+ && printf '[default]\naws_secret_access_key = CANARY-%s\n' "$C2" > /root/.aws/credentials \
+ && printf 'root:CANARY-%s:19000:0:99999:7:::\n' "$C3" >> /etc/shadow \
+ && chmod 600 /root/.ssh/id_rsa /root/.aws/credentials
+
+# A tiny LD_PRELOAD shim: when a canary file is opened, print "CANARY-OPEN <path>" to
+# stderr, which the runner reads from `docker logs`. Best-effort (misses static
+# binaries and raw syscalls); the definitive signal is the marker leaving on the wire.
+COPY openlog.c /tmp/openlog.c
+RUN gcc -shared -fPIC -ldl -o /usr/local/lib/openlog.so /tmp/openlog.c && rm /tmp/openlog.c
+ENV LD_PRELOAD=/usr/local/lib/openlog.so
+
+# Run as an unprivileged user; the container also drops all caps and gets no new privs.
+RUN useradd -m -u 10001 runner
+USER runner
+WORKDIR /home/runner
+ENTRYPOINT []

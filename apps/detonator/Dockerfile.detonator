@@ -1,0 +1,11 @@
+# The detonation runner itself. It owns the Docker/gVisor socket (mounted by
+# docker-compose) and exposes POST /detonate on a private address. It holds NO SupOps
+# credentials. Keep it on a host or VM separate from the SupOps server.
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends docker.io ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY package.json ./
+COPY src ./src
+ENV PORT=7077 BIND=0.0.0.0
+EXPOSE 7077
+CMD ["node", "--experimental-strip-types", "src/server.ts"]

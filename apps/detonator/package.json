@@ -1,0 +1,11 @@
+{
+  "name": "@supops/detonator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway sandbox that detonates agent scripts and reports what they try to do. Runs separately from the SupOps server; owns the Docker/gVisor socket, never SupOps' credentials.",
+  "scripts": {
+    "start": "node --experimental-strip-types src/server.ts",
+    "test": "node --test --experimental-strip-types src/*.test.ts"
+  }
+}
