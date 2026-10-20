@@ -64,17 +64,22 @@ export const TERMINAL_TOOL_CALL_STATES: readonly ToolCallState[] = [
 export const isTerminalToolCall = (s: ToolCallState): boolean =>
   TERMINAL_TOOL_CALL_STATES.includes(s);
 
-export const TARGET_KINDS = ['ssh', 'docker', 'k8s', 'http', 'prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana'] as const;
+export const TARGET_KINDS = ['ssh', 'docker', 'k8s', 'http', 'prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana', 'tempo', 'jaeger', 'signoz', 'github', 'gitlab'] as const;
 export type TargetKind = (typeof TARGET_KINDS)[number];
 
 /** Observability backends: reached over their HTTP API, read-only. */
-export const OBSERVABILITY_KINDS = ['prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana'] as const;
+export const OBSERVABILITY_KINDS = ['prometheus', 'alertmanager', 'loki', 'elasticsearch', 'grafana', 'tempo', 'jaeger', 'signoz'] as const;
 export type ObservabilityKind = (typeof OBSERVABILITY_KINDS)[number];
 export const isObservabilityKind = (k: string): k is ObservabilityKind =>
   (OBSERVABILITY_KINDS as readonly string[]).includes(k);
 
+/** Source control and CI: repositories, pull/merge requests, pipelines. Read-only for now. */
+export const SCM_KINDS = ['github', 'gitlab'] as const;
+export type ScmKind = (typeof SCM_KINDS)[number];
+export const isScmKind = (k: string): k is ScmKind => (SCM_KINDS as readonly string[]).includes(k);
+
 /** How each kind is grouped in the inventory and UI, and whether health scans cover it. */
-export const KIND_META: Record<TargetKind, { category: 'machine' | 'cluster' | 'observability' | 'http'; label: string; healthScan: boolean }> = {
+export const KIND_META: Record<TargetKind, { category: 'machine' | 'cluster' | 'observability' | 'scm' | 'http'; label: string; healthScan: boolean }> = {
   ssh: { category: 'machine', label: 'Machine', healthScan: true },
   docker: { category: 'machine', label: 'Docker host', healthScan: false },
   k8s: { category: 'cluster', label: 'Kubernetes cluster', healthScan: true },
@@ -84,6 +89,11 @@ export const KIND_META: Record<TargetKind, { category: 'machine' | 'cluster' | '
   loki: { category: 'observability', label: 'Loki', healthScan: false },
   elasticsearch: { category: 'observability', label: 'Elasticsearch / OpenSearch', healthScan: false },
   grafana: { category: 'observability', label: 'Grafana (Prometheus datasource)', healthScan: false },
+  tempo: { category: 'observability', label: 'Tempo (traces)', healthScan: false },
+  jaeger: { category: 'observability', label: 'Jaeger (traces)', healthScan: false },
+  signoz: { category: 'observability', label: 'SigNoz (traces)', healthScan: false },
+  github: { category: 'scm', label: 'GitHub', healthScan: false },
+  gitlab: { category: 'scm', label: 'GitLab', healthScan: false },
 };
 
 export const ENVS = ['dev', 'staging', 'prod'] as const;
@@ -97,10 +107,11 @@ export type Role = (typeof ROLES)[number];
 
 /**
  * Where an alert came from: a Slack message, read from a connection (Alertmanager,
- * Prometheus rules, Grafana-managed alerts), or raised by SupOps itself from a
- * forecast or anomaly.
+ * Prometheus rules, Grafana-managed alerts), pushed by webhook (the same three, or
+ * PagerDuty, Opsgenie, or any JSON sender as `webhook`), or raised by SupOps itself
+ * from a forecast or anomaly.
  */
-export const ALERT_SOURCES = ['slack', 'alertmanager', 'prometheus', 'grafana', 'supops'] as const;
+export const ALERT_SOURCES = ['slack', 'alertmanager', 'prometheus', 'grafana', 'supops', 'pagerduty', 'opsgenie', 'webhook'] as const;
 export type AlertSource = (typeof ALERT_SOURCES)[number];
 
 /**

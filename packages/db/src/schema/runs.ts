@@ -80,6 +80,11 @@ export const runs = sqliteTable(
      * tripped and looks identical to a hung run.
      */
     retryCount: integer('retry_count').notNull().default(0),
+    /**
+     * The model's own summary of the conversation up to step `throughSeq`, sent in place
+     * of those steps once the run outgrew its context. The steps themselves are kept.
+     */
+    compaction: text('compaction', { mode: 'json' }).$type<{ throughSeq: number; summary: string; at: number } | null>(),
 
     startedBy: text('started_by').references(() => users.id),
     startedAt: ts('started_at').notNull().$defaultFn(() => new Date()),
@@ -189,6 +194,23 @@ export const toolCalls = sqliteTable(
     index('tool_calls_signature').on(t.signature),
   ],
 );
+
+/**
+ * A tool's whole output, when it was longer than the run's per-call budget. The model
+ * is shown the head and tail (tool_calls.result_json) and reads the rest on demand with
+ * read_output, instead of re-running the command. Already redacted like the rest.
+ */
+export const toolOutputs = sqliteTable('tool_outputs', {
+  toolCallId: text('tool_call_id')
+    .primaryKey()
+    .references(() => toolCalls.id, { onDelete: 'cascade' }),
+  runId: text('run_id')
+    .notNull()
+    .references(() => runs.id, { onDelete: 'cascade' }),
+  text: text('text').notNull(),
+  bytes: integer('bytes').notNull(),
+  createdAt: createdAt(),
+});
 
 /**
  * The durable half of the UI stream. Token deltas are best-effort over the socket;

@@ -23,6 +23,8 @@ export function formatValue(v: number, unit: string): string {
 export function formatEta(ms: number): string {
   if (ms <= 0) return 'now';
   const m = Math.round(ms / 60_000);
+  // Rounding would say "0m" for the last half-minute.
+  if (m < 1) return '<1m';
   if (m < 60) return `${m}m`;
   const h = ms / 3_600_000;
   if (h < 48) return `${Math.floor(h)}h${m % 60 ? ` ${m % 60}m` : ''}`;

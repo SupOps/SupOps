@@ -3,6 +3,7 @@ import type { RiskTier } from '@supops/shared';
 import { createdAt, id, ts } from './_common.ts';
 import { projects } from './identity.ts';
 import { targets } from './targets.ts';
+import { runs } from './runs.ts';
 
 /**
  * Enforcement the engine learned from what happened in earlier runs.
@@ -40,4 +41,33 @@ export const learnedRules = sqliteTable(
     updatedAt: ts('updated_at'),
   },
   (t) => [index('learned_rules_project').on(t.projectId, t.status, t.signature)],
+);
+
+/**
+ * What a finished run taught, as the model proposed it after the run, and what the
+ * lesson gate (plain code, not a model) decided: kept as knowledge (approved only for
+ * an observed fact with evidence and no commands, otherwise a draft an admin
+ * approves), or rejected, with every reason. Rejected lessons are kept too, so the
+ * gate can be checked.
+ */
+export const lessons = sqliteTable(
+  'lessons',
+  {
+    id: id(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    runId: text('run_id').references(() => runs.id, { onDelete: 'set null' }),
+    kind: text('kind').$type<'fact' | 'pitfall' | 'runbook_step'>().notNull(),
+    title: text('title').notNull(),
+    body: text('body').notNull(),
+    /** Tool calls (their ids within the run) the lesson rests on. */
+    evidence: text('evidence', { mode: 'json' }).$type<string[]>().notNull().default([]),
+    targetSlugs: text('target_slugs', { mode: 'json' }).$type<string[]>().notNull().default([]),
+    verdict: text('verdict').$type<'approved' | 'draft' | 'rejected'>().notNull(),
+    reasons: text('reasons', { mode: 'json' }).$type<string[]>().notNull().default([]),
+    knowledgeDocId: text('knowledge_doc_id'),
+    createdAt: createdAt(),
+  },
+  (t) => [index('lessons_project').on(t.projectId, t.createdAt)],
 );

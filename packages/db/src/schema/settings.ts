@@ -95,12 +95,32 @@ export interface StoredObservabilitySettings {
   autoTriage: boolean;
   /** Lowest severity that is triaged automatically. */
   triageMinSeverity: 'critical' | 'warning' | 'info';
+  /** Wait this long after an incident opens before diagnosing it, so related alerts can join (0: straight away). */
+  triageGatherSeconds: number;
   /** At most this many automatic investigations start per hour, across all projects. */
   triageMaxPerHour: number;
   /** Open an incident when a resource is predicted to run out within this many hours. */
   predictWarningHours: number;
   /** ...and mark it critical within this many. */
   predictCriticalHours: number;
+  /** An alert is flapping after this many fire/resolve changes within `flapWindowMin`. */
+  flapChanges: number;
+  /** The window for flapping, and how long a flapping alert must stay quiet to settle. */
+  flapWindowMin: number;
+  /** Reply with the diagnosis in the Slack thread an alert arrived in. Off unless switched on. */
+  slackThreadReplies: boolean;
 }
 
 export const OBSERVABILITY_SETTINGS_KEY = 'observability';
+
+/**
+ * Learning after a run. `reflect`: off; drafts (every lesson waits for an admin, the
+ * default); or auto (an observed fact with evidence and no commands is approved at
+ * once, scoped to its machines and never pinned; everything else is still a draft).
+ */
+export interface StoredLearningSettings {
+  reflect: 'off' | 'drafts' | 'auto';
+  /** Only runs with at least this many actions are reflected on. */
+  reflectMinActions: number;
+}
+export const LEARNING_SETTINGS_KEY = 'learning';

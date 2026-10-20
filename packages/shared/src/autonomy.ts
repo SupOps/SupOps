@@ -29,7 +29,8 @@ export interface AutonomyPolicy {
 /** Nothing above this ever runs without a human. */
 export const AUTONOMY_HARD_CAP: RiskTier = 'medium';
 export const DEFAULT_PROD_AUTO_CAP: RiskTier = 'low';
-export const DEFAULT_TOOL_AUTO_CAPS: Record<string, RiskTier> = {};
+/** A script runs on its own only when every line is read-only, whatever the project allows. */
+export const DEFAULT_TOOL_AUTO_CAPS: Record<string, RiskTier> = { run_script: 'read_only' };
 export const DEFAULT_TRIGGER_AUTO_CAPS: Partial<Record<string, RiskTier>> = {
   health: 'read_only',
   alert: 'low',

@@ -132,21 +132,36 @@ export type TargetConfig =
       allowedCidrs?: string[];
       defaultHeaders?: Record<string, string>;
     }
-  | ObservabilityConfig;
+  | ObservabilityConfig
+  | ScmConfig;
+
+/**
+ * A GitHub or GitLab connection. The token is the target's credential (a bearer
+ * credential); use a read-only, repo-scoped token.
+ */
+export interface ScmConfig {
+  kind: 'github' | 'gitlab';
+  /** https://api.github.com, a GitHub Enterprise API URL, or a GitLab base URL (https://gitlab.com). */
+  baseUrl: string;
+  /** Repositories the agent may read, as owner/name (GitHub) or group/project (GitLab); `*` globs allowed. Must be non-empty. */
+  repos: string[];
+  allowPrivateNetwork: boolean;
+  insecureSkipVerify?: boolean;
+}
 
 /**
  * An observability backend reached over its HTTP API. Nothing secret lives here:
  * the token or password is the target's credential.
  */
 export interface ObservabilityConfig {
-  kind: 'prometheus' | 'alertmanager' | 'loki' | 'elasticsearch' | 'grafana';
+  kind: 'prometheus' | 'alertmanager' | 'loki' | 'elasticsearch' | 'grafana' | 'tempo' | 'jaeger' | 'signoz';
   /** e.g. https://prometheus.internal:9090 -- requests never leave this origin. */
   baseUrl: string;
   /** Allow private/loopback addresses (an in-cluster or LAN backend). Cloud metadata is always refused. */
   allowPrivateNetwork: boolean;
   /** Accept a self-signed certificate. */
   insecureSkipVerify?: boolean;
-  /** Loki multi-tenancy: sent as X-Scope-OrgID. */
+  /** Loki and Tempo multi-tenancy: sent as X-Scope-OrgID. */
   tenantId?: string;
   /** Elasticsearch: index patterns queries may name. Empty = any. */
   indices?: string[];

@@ -71,7 +71,7 @@ export const THREAT_LABEL: Record<ThreatCategory, string> = {
 
 /** One stage's contribution to a decision, kept for the audit trail and the approver UI. */
 export interface RiskContribution {
-  stage: 'baseline' | 'arguments' | 'target' | 'model' | 'override';
+  stage: 'baseline' | 'arguments' | 'target' | 'learned' | 'observed' | 'model' | 'override';
   tier: RiskTier;
   ruleId?: string;
   reason: string;
@@ -94,4 +94,23 @@ export interface RiskAssessment {
    * makes an action look safer than it is.
    */
   trusted?: { ruleId: string; by: string | null; byName: string | null };
+  /** Shown to the approver: a change proposed before anything on that machine was read. */
+  preflight?: string;
+  /**
+   * What a shadow/dry-run simulation observed before approval, for the "what it would
+   * actually do" panel. Any risk it implied is already folded into `contributions` as
+   * the `observed` stage; this is the human-readable record, including the blind spots
+   * it could not see (never assume "safe" from a quiet simulation).
+   */
+  observed?: {
+    status: 'observed' | 'skipped' | 'unavailable' | 'error';
+    simulator: string | null;
+    note?: string;
+    /** What actually ran inside the sandbox, so the approver can see it, not just its effects. */
+    command?: string;
+    items: Array<{ kind: string; detail: string }>;
+    blindSpots?: string[];
+    /** When the simulation ran (epoch ms), so a stale one can be re-checked before execution. */
+    at: number;
+  };
 }

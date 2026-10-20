@@ -1,7 +1,7 @@
 import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 import type { AlertSeverity, EvidenceStatus, IncidentStatus, TriageState } from '@supops/shared';
 import { createdAt, id, ts } from './_common.ts';
-import { projects } from './identity.ts';
+import { projects, users } from './identity.ts';
 import { targets } from './targets.ts';
 import { runs } from './runs.ts';
 
@@ -38,6 +38,10 @@ export const incidents = sqliteTable(
     confidence: text('confidence'),
     /** The diagnosis' verdict in plain terms: act_now | can_wait | none. */
     action: text('action').$type<'act_now' | 'can_wait' | 'none'>(),
+    /** What the diagnosis weighed: each cause confirmed, ruled out or untested, with its evidence. */
+    hypotheses: text('hypotheses', { mode: 'json' }).$type<Array<{ hypothesis: string; verdict: 'confirmed' | 'ruled_out' | 'untested'; evidence: string }>>(),
+    /** What is affected, what was checked and is fine, and what was not checked. */
+    blastRadius: text('blast_radius', { mode: 'json' }).$type<{ affected: string | null; healthy: string | null; unchecked: string | null }>(),
 
     openedAt: createdAt(),
     lastSeenAt: ts('last_seen_at').notNull().$defaultFn(() => new Date()),
@@ -53,8 +57,88 @@ export const incidents = sqliteTable(
     /** Who ignored it, and why -- shown with the incident. */
     ignoredBy: text('ignored_by'),
     ignoreReason: text('ignore_reason'),
+    /**
+     * Someone is on it. An acknowledgement lapses by itself when the incident gets
+     * worse (a new alert joins, or a worse severity), so it can never hide news.
+     */
+    acknowledgedAt: ts('acknowledged_at'),
+    acknowledgedBy: text('acknowledged_by').references(() => users.id, { onDelete: 'set null' }),
+    /** Who owns it now. Any user; changing the status never changes this. */
+    assigneeId: text('assignee_id').references(() => users.id, { onDelete: 'set null' }),
+    /** A person set the severity: new alerts no longer raise or lower it. */
+    severityPinned: integer('severity_pinned', { mode: 'boolean' }).notNull().default(false),
+    /** Made by this correlation rule, for this group (its group-by values). */
+    ruleId: text('rule_id'),
+    ruleGroupKey: text('rule_group_key'),
+    /**
+     * Waiting for its rule's threshold: not listed, not counted, not diagnosed until
+     * enough alerts join. Its alerts are shown on the Alerts page meanwhile.
+     */
+    held: integer('held', { mode: 'boolean' }).notNull().default(false),
   },
   (t) => [index('incidents_project_status').on(t.projectId, t.status, t.openedAt), index('incidents_resolved').on(t.resolvedAt)],
+);
+
+/** A person's grouping rule (see rules.ts in core). Evaluated in `priority` order, lowest first. */
+export const correlationRules = sqliteTable(
+  'correlation_rules',
+  {
+    id: id(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    matchers: text('matchers', { mode: 'json' }).$type<Array<{ name: string; op: '=' | '!=' | '=~' | '!~'; value: string }>>().notNull(),
+    groupBy: text('group_by', { mode: 'json' }).$type<string[]>().notNull(),
+    windowMin: integer('window_min').notNull().default(15),
+    threshold: integer('threshold').notNull().default(1),
+    resolveOn: text('resolve_on').$type<'all' | 'first' | 'never'>().notNull().default('all'),
+    titleTemplate: text('title_template').notNull().default(''),
+    priority: integer('priority').notNull().default(100),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+    createdBy: text('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: createdAt(),
+    /** Incidents it has made, and alerts it has grouped: shown so a useless rule is easy to spot. */
+    incidentsMade: integer('incidents_made').notNull().default(0),
+    alertsGrouped: integer('alerts_grouped').notNull().default(0),
+    lastMatchedAt: ts('last_matched_at'),
+  },
+  (t) => [index('correlation_rules_project').on(t.projectId, t.priority)],
+);
+
+export type IncidentEventKind =
+  | 'acknowledged'
+  | 'unacknowledged'
+  | 'ack_lapsed'
+  | 'assigned'
+  | 'comment'
+  | 'severity'
+  | 'merged_in'
+  | 'split_out'
+  | 'resolved'
+  | 'reopened';
+
+/**
+ * What people did with an incident, and what undid it: acknowledgements, assignment,
+ * comments, severity changes, merges. Append-only -- never edited or deleted -- so the
+ * timeline is a record. (What the alerts and the diagnosis did is read from them.)
+ */
+export const incidentEvents = sqliteTable(
+  'incident_events',
+  {
+    id: id(),
+    incidentId: text('incident_id')
+      .notNull()
+      .references(() => incidents.id, { onDelete: 'cascade' }),
+    at: createdAt(),
+    actorId: text('actor_id').references(() => users.id, { onDelete: 'set null' }),
+    /** Kept with the event, so it still reads right after the user is removed. Null: SupOps itself. */
+    actorName: text('actor_name'),
+    kind: text('kind').$type<IncidentEventKind>().notNull(),
+    /** comment: { text }; assigned: { to, toName }; severity: { from, to }; ... */
+    data: text('data', { mode: 'json' }).$type<Record<string, unknown>>(),
+  },
+  (t) => [index('incident_events_incident').on(t.incidentId, t.at)],
 );
 
 /**
@@ -114,8 +198,10 @@ export const watches = sqliteTable(
     badDirection: text('bad_direction').$type<'up' | 'down' | 'both'>().notNull().default('both'),
     /** When set, the watch forecasts the time until this limit is reached. */
     limit: text('limit', { mode: 'json' }).$type<WatchLimit | null>(),
+    /** Self-adjusting threshold: each series learns P99 + n x IQR from its last 7 days. */
+    adaptive: text('adaptive', { mode: 'json' }).$type<{ iqrs: number } | null>(),
     /** stack = the observability stack's own health. */
-    group: text('group').$type<'resources' | 'traffic' | 'kubernetes' | 'stack' | 'custom'>().notNull().default('custom'),
+    group: text('group').$type<'resources' | 'traffic' | 'kubernetes' | 'databases' | 'stack' | 'custom'>().notNull().default('custom'),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
     lastRunAt: ts('last_run_at'),
     lastError: text('last_error'),
@@ -205,4 +291,36 @@ export const watchSeries = sqliteTable(
     updatedAt: ts('updated_at').notNull().$defaultFn(() => new Date()),
   },
   (t) => [primaryKey({ columns: [t.watchId, t.series] }), index('watch_series_score').on(t.watchId, t.score)],
+);
+
+/** The limit each series of an adaptive watch learned from its last 7 days, relearned daily. */
+export const adaptiveLimits = sqliteTable(
+  'adaptive_limits',
+  {
+    watchId: text('watch_id')
+      .notNull()
+      .references(() => watches.id, { onDelete: 'cascade' }),
+    series: text('series').notNull(),
+    labels: text('labels', { mode: 'json' }).$type<Record<string, string>>().notNull(),
+    upper: real('upper'),
+    lower: real('lower'),
+    computedAt: ts('computed_at').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.watchId, t.series] })],
+);
+
+/** A person said two incidents are not the same problem: never suggested for merging again. */
+export const incidentDismissals = sqliteTable(
+  'incident_dismissals',
+  {
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    /** The two incident ids, in sorted order. */
+    a: text('a').notNull(),
+    b: text('b').notNull(),
+    by: text('by').references(() => users.id, { onDelete: 'set null' }),
+    at: ts('at').notNull().$defaultFn(() => new Date()),
+  },
+  (t) => [primaryKey({ columns: [t.a, t.b] })],
 );
