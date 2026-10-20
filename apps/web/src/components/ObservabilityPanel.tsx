@@ -54,6 +54,15 @@ export function ObservabilityPanel({ canEdit }: { canEdit: boolean }) {
                   options={[{ value: 'info', label: 'Every alert' }, { value: 'warning', label: 'Warning and up' }, { value: 'critical', label: 'Critical' }]}
                 />
               </Row>
+              <Row title="Wait before diagnosing" hint="Problems rarely arrive as one alert: related alerts that start within a few minutes join the incident first, so it is diagnosed once, as a whole.">
+                <Segmented
+                  label="Wait"
+                  value={String(c.triageGatherSeconds) as '0' | '60' | '180' | '300'}
+                  disabled={!canEdit}
+                  onChange={(v) => save.mutate({ triageGatherSeconds: Number(v) })}
+                  options={[{ value: '0', label: 'None' }, { value: '60', label: '1 min' }, { value: '180', label: '3 min' }, { value: '300', label: '5 min' }]}
+                />
+              </Row>
               <Row title="At most per hour" hint="Automatic diagnoses across all projects; beyond this, incidents still get their evidence and Investigate starts one.">
                 <Segmented
                   label="Per hour"
@@ -72,6 +81,21 @@ export function ObservabilityPanel({ canEdit }: { canEdit: boolean }) {
               disabled={!canEdit}
               onChange={(v) => save.mutate({ predictWarningHours: Number(v), predictCriticalHours: Math.max(1, Number(v) / 6) })}
               options={[{ value: '12', label: '12h' }, { value: '24', label: '24h' }, { value: '72', label: '3 days' }, ...(![12, 24, 72].includes(c.predictWarningHours) ? [{ value: String(c.predictWarningHours) as '12', label: `${c.predictWarningHours}h` }] : [])]}
+            />
+          </Row>
+          <Row title="Reply in the Slack thread" hint="When an alert arrived through Slack, post its diagnosis as a reply in that alert's thread.">
+            <Switch label="Reply in Slack threads" checked={c.slackThreadReplies} disabled={!canEdit || save.isPending} onChange={(v) => save.mutate({ slackThreadReplies: v })} />
+          </Row>
+          <Row
+            title="Flapping after"
+            hint={`An alert that fires and resolves this often within ${c.flapWindowMin} minutes stays one incident, is marked flapping, and is diagnosed once it has been quiet that long.`}
+          >
+            <Segmented
+              label="Flapping threshold"
+              value={String(c.flapChanges) as '4' | '6' | '10'}
+              disabled={!canEdit}
+              onChange={(v) => save.mutate({ flapChanges: Number(v) })}
+              options={[{ value: '4', label: '4 changes' }, { value: '6', label: '6' }, { value: '10', label: '10' }, ...(![4, 6, 10].includes(c.flapChanges) ? [{ value: String(c.flapChanges) as '4', label: String(c.flapChanges) }] : [])]}
             />
           </Row>
           <Row title="Sample signals every" hint="Each signal is one query per sample.">

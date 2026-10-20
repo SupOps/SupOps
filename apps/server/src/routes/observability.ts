@@ -1,17 +1,19 @@
 import { Router } from 'express';
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { agents, alerts, evidence, incidents, observations, runs, targets, toolCalls, watchSeries, watches } from '@supops/db';
-import { loadTargets, parseSeriesKey, runChecks, SIGNALS } from '@supops/core';
+import { agents, alerts, correlationRules, evidence, incidentEvents, incidents, observations, runs, targets, toolCalls, users, watchSeries, watches } from '@supops/db';
+import { loadTargets, parseSeriesKey, runChecks, SIGNALS, drainPatterns, obsRequest } from '@supops/core';
 import { formatValue } from '@supops/shared';
 import { isAdmin } from '../auth.ts';
 import { db, settingsStore } from '../context.ts';
 import { audit } from '../services/audit.ts';
 import { startRun } from '../services/start-run.ts';
 import { importsAlerts, projectConnections, watchesMetrics } from '../observe/connections.ts';
+import { forgetAdaptive } from '../observe/adaptive.ts';
 import { pollConnection, pollStatus } from '../observe/alert-poller.ts';
-import { mergeIncidents, reopenIncident, splitIncident } from '../observe/incidents.ts';
+import { dismissSuggestion, mergeIncidents, reopenIncident, splitIncident, suggestMerges } from '../observe/incidents.ts';
 import { incidentMapView } from '../servicemap/context.ts';
+import { recordIncidentEvent } from '../observe/incident-events.ts';
 import { enqueueTriage, gatherEvidence, latestFixRun, startIncidentRun } from '../observe/triage.ts';
 import { cachedPrediction, combinedChart, discover, reevaluateWatch, resolveWatchObservations, seriesChart, watchConnection, watcher, watchSeriesList } from '../observe/watcher.ts';
 
@@ -41,7 +43,7 @@ observabilityRoutes.get('/overview', (req, res) => {
   const open = db
     .select()
     .from(incidents)
-    .where(and(eq(incidents.projectId, projectId), eq(incidents.status, 'open')))
+    .where(and(eq(incidents.projectId, projectId), eq(incidents.status, 'open'), eq(incidents.held, false)))
     .orderBy(SEV, desc(incidents.lastSeenAt))
     .limit(20)
     .all();
@@ -65,8 +67,9 @@ observabilityRoutes.get('/overview', (req, res) => {
     .all();
   const conns = projectConnections(projectId);
   const ws = db.select().from(watches).where(eq(watches.projectId, projectId)).all();
+  const owners = userNames(open.map((i) => i.assigneeId));
   res.json({
-    incidents: open.map((i) => ({ ...i, alertCount: counts.find((c) => c.incidentId === i.id)?.n ?? 0 })),
+    incidents: open.map((i) => ({ ...i, alertCount: counts.find((c) => c.incidentId === i.id)?.n ?? 0, assigneeName: i.assigneeId ? owners.get(i.assigneeId) ?? null : null })),
     observations: obs,
     connections: conns.map((c) => ({
       id: c.id, slug: c.slug, kind: c.kind,
@@ -89,7 +92,7 @@ observabilityRoutes.get('/overview', (req, res) => {
 observabilityRoutes.get('/count', (req, res) => {
   const projectId = requireProject(req, res);
   if (!projectId) return;
-  const n = db.select({ n: sql<number>`count(*)` }).from(incidents).where(and(eq(incidents.projectId, projectId), eq(incidents.status, 'open'))).get()?.n ?? 0;
+  const n = db.select({ n: sql<number>`count(*)` }).from(incidents).where(and(eq(incidents.projectId, projectId), eq(incidents.status, 'open'), eq(incidents.held, false))).get()?.n ?? 0;
   res.json({ open: n });
 });
 
@@ -100,7 +103,7 @@ observabilityRoutes.get('/incidents', (req, res) => {
   const rows = db
     .select()
     .from(incidents)
-    .where(and(eq(incidents.projectId, projectId), isNull(incidents.mergedInto), ...(status ? [eq(incidents.status, status)] : [])))
+    .where(and(eq(incidents.projectId, projectId), isNull(incidents.mergedInto), eq(incidents.held, false), ...(status ? [eq(incidents.status, status)] : [])))
     .orderBy(desc(incidents.openedAt))
     .limit(200)
     .all();
@@ -110,7 +113,25 @@ observabilityRoutes.get('/incidents', (req, res) => {
     .where(inArray(alerts.incidentId, rows.map((i) => i.id).concat('-')))
     .groupBy(alerts.incidentId)
     .all();
-  res.json(rows.map((i) => ({ ...i, alertCount: counts.find((c) => c.incidentId === i.id)?.n ?? 0 })));
+  const names = userNames(rows.flatMap((i) => [i.assigneeId, i.acknowledgedBy]));
+  res.json(
+    rows.map((i) => ({
+      ...i,
+      alertCount: counts.find((c) => c.incidentId === i.id)?.n ?? 0,
+      assigneeName: i.assigneeId ? names.get(i.assigneeId) ?? null : null,
+      acknowledgedByName: i.acknowledgedBy ? names.get(i.acknowledgedBy) ?? null : null,
+    })),
+  );
+});
+
+function userNames(ids: Array<string | null | undefined>): Map<string, string> {
+  const want = [...new Set(ids.filter((x): x is string => !!x))];
+  return new Map(want.length ? db.select({ id: users.id, name: users.name }).from(users).where(inArray(users.id, want)).all().map((u) => [u.id, u.name]) : []);
+}
+
+/** Who an incident can be assigned to: every active user, by name. */
+observabilityRoutes.get('/assignees', (_req, res) => {
+  res.json(db.select({ id: users.id, name: users.name }).from(users).where(isNull(users.disabledAt)).orderBy(asc(users.name)).all());
 });
 
 observabilityRoutes.get('/incidents/:id', (req, res) => {
@@ -149,6 +170,24 @@ observabilityRoutes.get('/incidents/:id', (req, res) => {
     timeline.push({ at: inc.resolvedAt.getTime(), kind: 'ignored', text: `Ignored${inc.ignoredBy ? ` by ${inc.ignoredBy}` : ''}${inc.ignoreReason ? `: ${inc.ignoreReason}` : ''}` });
     if (inc.ignoredUntil) timeline.push({ at: inc.ignoredUntil.getTime(), kind: 'pending', text: 'Checked again: reopens if still firing' });
   } else if (inc.resolvedAt) timeline.push({ at: inc.resolvedAt.getTime(), kind: 'closed', text: inc.mergedInto ? 'Merged into another incident' : 'Incident resolved' });
+  // What people did, from the incident's own record.
+  const events = db.select().from(incidentEvents).where(eq(incidentEvents.incidentId, inc.id)).orderBy(asc(incidentEvents.at)).all();
+  const who = (e: (typeof events)[number]) => e.actorName ?? 'SupOps';
+  for (const e of events) {
+    const d = (e.data ?? {}) as Record<string, string | number | undefined>;
+    const text =
+      e.kind === 'acknowledged' ? (d.via ? `Acknowledged in ${d.via}${d.by ? ` by ${d.by}` : ''}` : `Acknowledged by ${who(e)}`)
+      : e.kind === 'unacknowledged' ? `${who(e)} took back the acknowledgement`
+      : e.kind === 'ack_lapsed' ? `Acknowledgement lapsed: ${d.reason ?? 'it got worse'}`
+      : e.kind === 'assigned' ? (d.to ? `${who(e)} assigned it to ${d.toName ?? 'someone'}` : `${who(e)} unassigned it`)
+      : e.kind === 'comment' ? `${who(e)}: ${d.text ?? ''}`
+      : e.kind === 'severity' ? `${who(e)} set the severity to ${d.to}`
+      : e.kind === 'merged_in' ? `${who(e)} merged in "${d.fromTitle ?? 'another incident'}"`
+      : e.kind === 'split_out' ? `${who(e)} split ${d.alerts ?? 'some'} alert${d.alerts === 1 ? '' : 's'} into "${d.toTitle ?? 'a new incident'}"`
+      : e.kind === 'resolved' ? `Marked resolved by ${who(e)}`
+      : `Reopened by ${who(e)}`;
+    timeline.push({ at: e.at.getTime(), kind: e.kind === 'comment' ? 'comment' : 'person', text });
+  }
   timeline.sort((a, b) => a.at - b.at);
 
   const others = db
@@ -158,8 +197,14 @@ observabilityRoutes.get('/incidents/:id', (req, res) => {
     .all()
     .filter((o) => o.id !== inc.id);
 
+  const names = userNames([inc.assigneeId, inc.acknowledgedBy]);
   res.json({
-    incident: { ...inc, targets: (inc.targetIds ?? []).map((id) => slugs.get(id)).filter(Boolean) },
+    incident: {
+      ...inc,
+      targets: (inc.targetIds ?? []).map((id) => slugs.get(id)).filter(Boolean),
+      assigneeName: inc.assigneeId ? names.get(inc.assigneeId) ?? null : null,
+      acknowledgedByName: inc.acknowledgedBy ? names.get(inc.acknowledgedBy) ?? null : null,
+    },
     alerts: members,
     evidence: ev.map((e) => ({ ...e, connection: e.connectionId ? slugs.get(e.connectionId) ?? null : null })),
     observations: obs,
@@ -168,6 +213,8 @@ observabilityRoutes.get('/incidents/:id', (req, res) => {
     map: incidentMapView(inc.projectId, inc.targetIds ?? [], inc.id),
     timeline,
     mergeCandidates: others,
+    suggestions: inc.status === 'open' ? suggestMerges(inc) : [],
+    rule: inc.ruleId ? db.select({ id: correlationRules.id, name: correlationRules.name, threshold: correlationRules.threshold, resolveOn: correlationRules.resolveOn }).from(correlationRules).where(eq(correlationRules.id, inc.ruleId)).get() ?? null : null,
   });
 });
 
@@ -212,6 +259,7 @@ observabilityRoutes.post('/incidents/:id/resolve', (req, res) => {
     .set({ status: 'resolved', resolvedAt: new Date(), decidedAt: new Date(), decidedBy: req.user?.id ?? null })
     .where(and(eq(alerts.incidentId, row.id), inArray(alerts.status, ['new', 'investigating'])))
     .run();
+  recordIncidentEvent(row.id, 'resolved', req.user);
   res.json(row);
 });
 
@@ -257,8 +305,22 @@ observabilityRoutes.post('/incidents/:id/reopen', (req, res) => {
     return;
   }
   audit(req.user, { projectId: row.projectId, entity: 'incident', entityId: row.id, action: 'reopen' });
+  recordIncidentEvent(row.id, 'reopened', req.user);
   if (row.triageState !== 'done' && row.triageState !== 'running') enqueueTriage(row.id);
   res.json(row);
+});
+
+/** "Not the same problem": never suggest merging these two again. */
+observabilityRoutes.post('/incidents/:id/not-related', (req, res) => {
+  const inc = db.select().from(incidents).where(eq(incidents.id, req.params.id)).get();
+  const other = typeof req.body?.other === 'string' ? db.select().from(incidents).where(eq(incidents.id, req.body.other)).get() : undefined;
+  if (!inc || !other || other.projectId !== inc.projectId) {
+    res.status(404).json({ error: 'Incident not found' });
+    return;
+  }
+  dismissSuggestion(inc.projectId, inc.id, other.id, req.user?.id ?? null);
+  audit(req.user, { projectId: inc.projectId, entity: 'incident', entityId: inc.id, action: 'not_related', after: { other: other.id } });
+  res.json({ ok: true });
 });
 
 observabilityRoutes.post('/incidents/:id/merge', (req, res) => {
@@ -267,7 +329,7 @@ observabilityRoutes.post('/incidents/:id/merge', (req, res) => {
     res.status(400).json({ error: 'into is required' });
     return;
   }
-  const r = mergeIncidents(req.params.id, body.data.into);
+  const r = mergeIncidents(req.params.id, body.data.into, req.user);
   if (!r) {
     res.status(400).json({ error: 'Those incidents cannot be merged.' });
     return;
@@ -281,13 +343,91 @@ observabilityRoutes.post('/incidents/:id/split', (req, res) => {
     res.status(400).json({ error: 'alertIds is required' });
     return;
   }
-  const r = splitIncident(req.params.id, body.data.alertIds);
+  const r = splitIncident(req.params.id, body.data.alertIds, req.user);
   if (!r) {
     res.status(400).json({ error: 'Choose some, but not all, of the incident\'s alerts.' });
     return;
   }
   enqueueTriage(r.id);
   res.json(r);
+});
+
+/** Someone is on it. Lapses by itself if the incident gets worse. */
+observabilityRoutes.post('/incidents/:id/acknowledge', (req, res) => {
+  const row = db
+    .update(incidents)
+    .set({ acknowledgedAt: new Date(), acknowledgedBy: req.user?.id ?? null })
+    .where(and(eq(incidents.id, req.params.id), eq(incidents.status, 'open')))
+    .returning()
+    .get();
+  if (!row) {
+    res.status(404).json({ error: 'No open incident with that id.' });
+    return;
+  }
+  recordIncidentEvent(row.id, 'acknowledged', req.user);
+  res.json(row);
+});
+
+observabilityRoutes.post('/incidents/:id/unacknowledge', (req, res) => {
+  const row = db.update(incidents).set({ acknowledgedAt: null, acknowledgedBy: null }).where(eq(incidents.id, req.params.id)).returning().get();
+  if (!row) {
+    res.status(404).json({ error: 'Incident not found' });
+    return;
+  }
+  recordIncidentEvent(row.id, 'unacknowledged', req.user);
+  res.json(row);
+});
+
+observabilityRoutes.post('/incidents/:id/assign', (req, res) => {
+  const body = z.object({ userId: z.string().nullable() }).safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: 'userId is required (null to unassign)' });
+    return;
+  }
+  const to = body.data.userId ? db.select({ id: users.id, name: users.name, disabledAt: users.disabledAt }).from(users).where(eq(users.id, body.data.userId)).get() : null;
+  if (body.data.userId && (!to || to.disabledAt)) {
+    res.status(400).json({ error: 'No active user with that id.' });
+    return;
+  }
+  const row = db.update(incidents).set({ assigneeId: to?.id ?? null }).where(eq(incidents.id, req.params.id)).returning().get();
+  if (!row) {
+    res.status(404).json({ error: 'Incident not found' });
+    return;
+  }
+  recordIncidentEvent(row.id, 'assigned', req.user, { to: to?.id ?? null, toName: to?.name ?? null });
+  res.json(row);
+});
+
+observabilityRoutes.post('/incidents/:id/comments', (req, res) => {
+  const body = z.object({ text: z.string().trim().min(1).max(4000) }).safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: 'Write something first (at most 4,000 characters).' });
+    return;
+  }
+  const inc = db.select({ id: incidents.id }).from(incidents).where(eq(incidents.id, req.params.id)).get();
+  if (!inc) {
+    res.status(404).json({ error: 'Incident not found' });
+    return;
+  }
+  recordIncidentEvent(inc.id, 'comment', req.user, { text: body.data.text });
+  res.status(201).json({ ok: true });
+});
+
+/** A person sets the severity: from then on, new alerts no longer change it. */
+observabilityRoutes.post('/incidents/:id/severity', (req, res) => {
+  const body = z.object({ severity: z.enum(['critical', 'warning', 'info']) }).safeParse(req.body);
+  if (!body.success) {
+    res.status(400).json({ error: 'severity must be critical, warning or info' });
+    return;
+  }
+  const before = db.select({ severity: incidents.severity }).from(incidents).where(eq(incidents.id, req.params.id)).get();
+  if (!before) {
+    res.status(404).json({ error: 'Incident not found' });
+    return;
+  }
+  const row = db.update(incidents).set({ severity: body.data.severity, severityPinned: true }).where(eq(incidents.id, req.params.id)).returning().get();
+  recordIncidentEvent(row.id, 'severity', req.user, { from: before.severity, to: body.data.severity });
+  res.json(row);
 });
 
 // ---- watches -----------------------------------------------------------------------
@@ -450,6 +590,8 @@ const watchBody = z.object({
   unit: z.enum(['percent', 'bytes', 'seconds', 'ratio', 'count', 'days', 'per_second']).default('count'),
   badDirection: z.enum(['up', 'down', 'both']).default('both'),
   limit: z.object({ value: z.number(), when: z.enum(['below', 'above']) }).nullable().default(null),
+  /** Self-adjusting threshold: P99 (or P1) of the last 7 days, plus (or minus) iqrs x IQR. */
+  adaptive: z.object({ iqrs: z.number().min(0.5).max(10) }).nullable().default(null),
 });
 
 observabilityRoutes.post('/watches', (req, res) => {
@@ -488,6 +630,7 @@ observabilityRoutes.patch('/watches/:id', async (req, res) => {
       unit: z.enum(['percent', 'bytes', 'seconds', 'ratio', 'count', 'days', 'per_second']).optional(),
       limit: watchBody.shape.limit.optional(),
       badDirection: z.enum(['up', 'down', 'both']).optional(),
+      adaptive: watchBody.shape.adaptive.optional(),
       /** Built-in signals: back to SupOps' own definition. */
       reset: z.literal(true).optional(),
     })
@@ -512,7 +655,11 @@ observabilityRoutes.patch('/watches/:id', async (req, res) => {
     patch = { title: spec.title, query: spec.query, unit: spec.unit, badDirection: spec.badDirection, limit: spec.limit };
   }
   const row = db.update(watches).set(patch).where(eq(watches.id, before.id)).returning().get();
-  audit(req.user, { projectId: row.projectId, entity: 'watch', entityId: row.id, action: reset ? 'reset' : 'update', before: { title: before.title, query: before.query, limit: before.limit, badDirection: before.badDirection, enabled: before.enabled }, after: patch });
+  audit(req.user, { projectId: row.projectId, entity: 'watch', entityId: row.id, action: reset ? 'reset' : 'update', before: { title: before.title, query: before.query, limit: before.limit, badDirection: before.badDirection, enabled: before.enabled, adaptive: before.adaptive }, after: patch });
+  // Learned limits belong to the query, direction and margin they were learned with.
+  if (['query', 'badDirection', 'adaptive', 'enabled'].some((k) => k in patch && JSON.stringify((patch as Record<string, unknown>)[k]) !== JSON.stringify((before as Record<string, unknown>)[k]))) {
+    forgetAdaptive(row, !row.adaptive || row.enabled === false);
+  }
 
   if (row.enabled === false) {
     resolveWatchObservations(row.id);
@@ -628,9 +775,13 @@ const settingsBody = z.object({
   watchIntervalMs: z.number().int().min(60_000).max(3_600_000).optional(),
   autoTriage: z.boolean().optional(),
   triageMinSeverity: z.enum(['critical', 'warning', 'info']).optional(),
+  triageGatherSeconds: z.number().int().min(0).max(1800).optional(),
   triageMaxPerHour: z.number().int().min(0).max(100).optional(),
   predictWarningHours: z.number().min(1).max(24 * 7).optional(),
   predictCriticalHours: z.number().min(0.5).max(72).optional(),
+  flapChanges: z.number().int().min(2).max(50).optional(),
+  flapWindowMin: z.number().int().min(5).max(24 * 60).optional(),
+  slackThreadReplies: z.boolean().optional(),
 });
 
 observabilityRoutes.put('/settings', (req, res) => {
@@ -647,4 +798,38 @@ observabilityRoutes.put('/settings', (req, res) => {
   const saved = settingsStore.saveObservability(body.data);
   audit(req.user, { entity: 'settings.observability', action: 'update', before, after: saved });
   res.json(saved);
+});
+
+// ---- log patterns --------------------------------------------------------------------
+
+/** Lines matching a query, grouped into patterns with counts over the window (new and spiking first). */
+observabilityRoutes.get('/log-patterns', async (req, res) => {
+  const projectId = String(req.query.projectId ?? '');
+  const conn = projectConnections(projectId, ['loki', 'elasticsearch']).find((c) => c.id === String(req.query.connectionId ?? ''));
+  if (!conn) {
+    res.status(400).json({ error: 'Choose a Loki or Elasticsearch connection of this project.' });
+    return;
+  }
+  const hours = Math.min(24, Math.max(0.25, Number(req.query.hours ?? 1)));
+  const end = Date.now();
+  const start = end - hours * 3_600_000;
+  const query = String(req.query.query ?? '').slice(0, 2000);
+  let lines: Array<{ line: string; ts: number }> = [];
+  if (conn.kind === 'loki') {
+    const r = await obsRequest(conn, '/loki/api/v1/query_range', { query: { query: query || '{job=~".+"} |~ "(?i)(error|exception|fatal|panic)"', start: `${start}000000`, end: `${end}000000`, limit: 2000, direction: 'backward' }, timeoutMs: 30_000 });
+    if ('error' in r) {
+      res.status(400).json({ error: r.error });
+      return;
+    }
+    lines = ((r.json as { data?: { result?: Array<{ values: Array<[string, string]> }> } }).data?.result ?? []).flatMap((s) => s.values.map(([ts, line]) => ({ line, ts: Number(ts.slice(0, 13)) })));
+  } else {
+    const index = (conn.config as { indices?: string[] }).indices?.[0] ?? '*';
+    const r = await obsRequest(conn, `/${index}/_search`, { jsonBody: { size: 2000, sort: [{ '@timestamp': { order: 'desc', unmapped_type: 'date' } }], query: { bool: { must: [{ query_string: { query: query || 'level:(error OR fatal) OR message:(error OR exception)' } }], filter: [{ range: { '@timestamp': { gte: new Date(start).toISOString(), lte: new Date(end).toISOString() } } }] } } }, timeoutMs: 30_000 });
+    if ('error' in r) {
+      res.status(400).json({ error: r.error });
+      return;
+    }
+    lines = (((r.json as { hits?: { hits?: Array<{ _source: Record<string, unknown> }> } }).hits?.hits) ?? []).map((h) => ({ line: String(h._source.message ?? h._source.log ?? JSON.stringify(h._source)), ts: Date.parse(String(h._source['@timestamp'] ?? '')) || end }));
+  }
+  res.json({ lines: lines.length, start, end, patterns: drainPatterns(lines, { buckets: 12, start, end }).slice(0, 100) });
 });

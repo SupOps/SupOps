@@ -23,6 +23,7 @@ import { db, settingsStore } from '../context.ts';
 import { projectConnections, watchesMetrics } from './connections.ts';
 import { enqueueTriage } from './triage.ts';
 import { reopenIncident } from './incidents.ts';
+import { checkAdaptive } from './adaptive.ts';
 
 /**
  * The watcher: every few minutes it looks at every series of the signals watched on
@@ -393,6 +394,7 @@ export async function watchConnection(projectId: string, conn: ResolvedTarget): 
   for (const w of list) {
     try {
       await sampleWatch(w, conn);
+      if (w.adaptive) await checkAdaptive(w, conn);
     } catch (err) {
       db.update(watches).set({ lastRunAt: new Date(), lastError: (err instanceof Error ? err.message : String(err)).slice(0, 500) }).where(eq(watches.id, w.id)).run();
     }

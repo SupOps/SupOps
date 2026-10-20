@@ -104,6 +104,7 @@ test('too little history: no forecast', () => {
 
 test('ETAs read naturally', () => {
   assert.equal(formatEta(0), 'now');
+  assert.equal(formatEta(20_000), '<1m', 'not "0m"');
   assert.equal(formatEta(45 * 60_000), '45m');
   assert.equal(formatEta(3 * HOUR + 20 * 60_000), '3h 20m');
   assert.equal(formatEta(72 * HOUR), '3.0 days');

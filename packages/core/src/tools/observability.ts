@@ -6,6 +6,7 @@ import { errOutput, okOutput, truncateOutput } from './output.ts';
 import { safeGet } from './executors/http.ts';
 import { formatEta } from '../observe/forecast.ts';
 import { predict } from '../observe/predict.ts';
+import { drainPatterns, patternLine } from '../observe/logs.ts';
 
 /**
  * Read-only query tools for observability backends: metrics (Prometheus), logs
@@ -23,7 +24,7 @@ const obsConfig = (t: ResolvedTarget) => t.config as unknown as ObservabilityCon
 function authHeaders(target: ResolvedTarget): Record<string, string> {
   const headers: Record<string, string> = {};
   const cfg = obsConfig(target);
-  if (cfg.kind === 'loki' && cfg.tenantId) headers['X-Scope-OrgID'] = cfg.tenantId;
+  if ((cfg.kind === 'loki' || cfg.kind === 'tempo') && cfg.tenantId) headers['X-Scope-OrgID'] = cfg.tenantId;
   if (!target.secret) return headers;
   let auth: ObservabilityAuth;
   try {
@@ -31,7 +32,11 @@ function authHeaders(target: ResolvedTarget): Record<string, string> {
   } catch {
     auth = { type: 'bearer', token: target.secret };
   }
-  if (auth.type === 'bearer') headers.authorization = `Bearer ${auth.token}`;
+  if (auth.type === 'bearer') {
+    // SigNoz takes its API key in its own header, not as a bearer token.
+    if (cfg.kind === 'signoz') headers['SIGNOZ-API-KEY'] = auth.token;
+    else headers.authorization = `Bearer ${auth.token}`;
+  }
   if (auth.type === 'basic') headers.authorization = `Basic ${Buffer.from(`${auth.username}:${auth.password}`).toString('base64')}`;
   return headers;
 }
@@ -116,7 +121,7 @@ function call(ctx: ExecContext, path: string, query: Record<string, string | num
   return obsRequest(ctx.target, path, { query, jsonBody, method, timeoutMs: ctx.timeoutMs, signal: ctx.signal });
 }
 
-const done = (ctx: ExecContext, text: string) => {
+export const done = (ctx: ExecContext, text: string) => {
   const t = truncateOutput(text, ctx.maxOutputBytes);
   return okOutput(t.text, { truncated: t.truncated, originalBytes: t.originalBytes });
 };
@@ -376,7 +381,7 @@ async function prometheusStatus(ctx: ExecContext): Promise<string> {
 
 const logsArgs = z.object({
   target: z.string(),
-  operation: z.enum(['search', 'status']).optional(),
+  operation: z.enum(['search', 'patterns', 'status']).optional(),
   query: z.string().max(2000).optional(),
   index: z.string().max(200).optional(),
   start: z.string().max(40).optional(),
@@ -426,9 +431,11 @@ export const queryLogsTool: ToolDef<z.infer<typeof logsArgs>> = {
     'Search logs (read-only). Loki: query is LogQL, e.g. {app="api"} |= "error". Elasticsearch/OpenSearch: ' +
     'query is Lucene query_string syntax, e.g. level:error AND service:api, and index names the index pattern. ' +
     'Default window is the last 15 minutes; newest lines first; at most 500 lines. ' +
+    'operation patterns runs the same search over up to 2000 lines and groups them into patterns (variable parts as <*>) with counts per sixth of the window, ' +
+    'marking patterns that are new in the latest part or spiking: the quickest way to see what changed in a noisy log. ' +
     'operation status (no query) checks the log backend itself: Loki readiness and version, or Elasticsearch cluster health and red/yellow indices.',
   parameters: {
-    operation: { type: 'string', enum: ['search', 'status'], description: 'search (default) or status.' },
+    operation: { type: 'string', enum: ['search', 'patterns', 'status'], description: 'search (default), patterns or status.' },
     query: { type: 'string', description: 'LogQL (Loki) or query_string (Elasticsearch). Required for search.' },
     index: { type: 'string', description: 'Elasticsearch index or pattern, e.g. logs-*.' },
     start: { type: 'string', description: 'Default now-15m.' },
@@ -444,15 +451,20 @@ export const queryLogsTool: ToolDef<z.infer<typeof logsArgs>> = {
   render: (a, t) =>
     a.operation === 'status'
       ? `[${t.slug}] status`
-      : `[${t.slug}] ${a.index ? `${a.index}: ` : ''}${a.query ?? ''} · ${a.start ?? 'now-15m'} → ${a.end ?? 'now'} · limit ${a.limit ?? 100}`,
+      : `[${t.slug}] ${a.operation === 'patterns' ? 'patterns of ' : ''}${a.index ? `${a.index}: ` : ''}${a.query ?? ''} · ${a.start ?? 'now-15m'} → ${a.end ?? 'now'}${a.operation === 'patterns' ? '' : ` · limit ${a.limit ?? 100}`}`,
   classifyArgs: () => READ,
   execute: async (a, ctx) => {
     const cfg = obsConfig(ctx.target);
     if (a.operation === 'status') return done(ctx, await logsStatus(ctx));
-    if (!a.query) return errOutput('search needs a query');
+    if (!a.query) return errOutput(`${a.operation ?? 'search'} needs a query`);
     const w = timeWindow(a.start, a.end, 'now-15m', cfg.maxRangeHours ?? 24);
     if ('error' in w) return errOutput(w.error);
-    const limit = a.limit ?? 100;
+    const patterns = a.operation === 'patterns';
+    const limit = patterns ? 2000 : (a.limit ?? 100);
+    const asPatterns = (entries: Array<{ line: string; ts: number }>) => {
+      const p = drainPatterns(entries, { buckets: 6, start: w.start, end: w.end });
+      return done(ctx, entries.length ? `${entries.length} lines${entries.length >= limit ? ' (the newest ' + limit + ')' : ''} in ${p.length} patterns, counts per sixth of the window (oldest first):\n${p.slice(0, 40).map(patternLine).join('\n')}` : '(no log lines matched)');
+    };
 
     if (cfg.kind === 'loki') {
       const r = await call(ctx, '/loki/api/v1/query_range', {
@@ -460,8 +472,9 @@ export const queryLogsTool: ToolDef<z.infer<typeof logsArgs>> = {
       });
       if ('error' in r) return errOutput(r.error);
       const streams = ((r.json as { data?: { result?: Array<{ stream: Record<string, string>; values: Array<[string, string]> }> } }).data?.result ?? []);
-      const lines = streams
-        .flatMap((s) => s.values.map(([ts, line]) => ({ ts: Number(ts.slice(0, 13)), stream: s.stream, line })))
+      const all = streams.flatMap((s) => s.values.map(([ts, line]) => ({ ts: Number(ts.slice(0, 13)), stream: s.stream, line })));
+      if (patterns) return asPatterns(all);
+      const lines = all
         .sort((x, y) => y.ts - x.ts)
         .slice(0, limit)
         .map((l) => `${new Date(l.ts).toISOString()} ${labelsOf(l.stream)} ${l.line.slice(0, 500)}`);
@@ -484,6 +497,9 @@ export const queryLogsTool: ToolDef<z.infer<typeof logsArgs>> = {
     });
     if ('error' in r) return errOutput(r.error);
     const hits = ((r.json as { hits?: { total?: { value?: number }; hits?: Array<{ _index: string; _source: Record<string, unknown> }> } }).hits);
+    if (patterns) {
+      return asPatterns((hits?.hits ?? []).map((h) => ({ line: String(h._source.message ?? h._source.msg ?? h._source.log ?? JSON.stringify(h._source)), ts: Date.parse(String(h._source['@timestamp'] ?? '')) || w.end })));
+    }
     const lines = (hits?.hits ?? []).map((h) => {
       const src = h._source;
       const msg = (src.message ?? src.msg ?? src.log ?? JSON.stringify(src)) as string;

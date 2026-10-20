@@ -3,7 +3,7 @@ import type { ObservabilityConfig } from '@supops/db';
 import type { ResolvedTarget } from '../tools/types.ts';
 import { indexAllowed, obsRequest } from '../tools/observability.ts';
 import { formatValue } from '@supops/shared';
-import { clusterLogLines } from './logs.ts';
+import { clusterLogLines, drainPatterns, patternLine } from './logs.ts';
 
 /**
  * The evidence pack: a fixed set of read-only checks run against an incident's
@@ -35,7 +35,7 @@ export interface CheckOutcome {
 export interface CheckDef {
   key: string;
   title: string;
-  group: 'alerts' | 'resources' | 'kubernetes' | 'traffic' | 'logs' | 'stack';
+  group: 'alerts' | 'resources' | 'kubernetes' | 'traffic' | 'databases' | 'logs' | 'stack';
   kinds: Array<ResolvedTarget['kind']>;
   /** Skip unless the scope has what the check needs (e.g. a namespace). */
   applies?: (s: CheckScope) => boolean;
@@ -437,6 +437,65 @@ export const STACK_CHECKS: CheckDef[] = [
 ];
 
 /** Log lines that look like errors, compared with the window before. */
+/**
+ * Checks that only apply when an optional collector is there: databases through their
+ * exporters, and node pressure (PSI, OOM kills) from node_exporter's newer collectors.
+ * The few numbers that explain most incidents of their kind.
+ */
+export const DATABASE_CHECKS: CheckDef[] = [
+  threshold({
+    key: 'psi_memory', title: 'Memory pressure (time stalled)', group: 'resources', requires: 'node_pressure_memory_waiting_seconds_total',
+    query: (s) => `100 * rate(${sel('node_pressure_memory_waiting_seconds_total', hostOrAll(s))}[5m])`, limit: 10, unit: '%', labels: ['instance'],
+    describe: (n) => `Tasks waited for memory over 10% of the time on ${n} host${n > 1 ? 's' : ''} (reclaim or swap is slowing everything down):`,
+  }),
+  threshold({
+    key: 'node_oom_kills', title: 'OOM kills (1h)', group: 'resources', requires: 'node_vmstat_oom_kill',
+    query: (s) => `sum by (instance) (increase(${sel('node_vmstat_oom_kill', hostOrAll(s))}[1h]))`, limit: 0.5, labels: ['instance'],
+    describe: (n) => `The kernel killed processes for running out of memory on ${n} host${n > 1 ? 's' : ''} in the last hour:`,
+  }),
+  threshold({
+    key: 'pg_connections', title: 'PostgreSQL connections used', group: 'databases', requires: 'pg_settings_max_connections',
+    query: (s) => `100 * sum by (instance) (${sel('pg_stat_activity_count', hostOrAll(s))}) / on (instance) max by (instance) (${sel('pg_settings_max_connections', hostOrAll(s))})`,
+    limit: 80, unit: '%', labels: ['instance'], describe: (n) => `PostgreSQL above 80% of its connection slots on ${n} server${n > 1 ? 's' : ''}:`,
+  }),
+  threshold({
+    key: 'pg_replication_lag', title: 'PostgreSQL replication lag', group: 'databases', requires: 'pg_replication_lag',
+    query: (s) => `max by (instance) (${sel('pg_replication_lag', hostOrAll(s))})`, limit: 30, unit: 's', labels: ['instance'],
+    describe: (n) => `${n} PostgreSQL replica${n > 1 ? 's are' : ' is'} more than 30 s behind:`,
+  }),
+  threshold({
+    key: 'pg_oldest_tx', title: 'PostgreSQL oldest open transaction', group: 'databases', requires: 'pg_stat_activity_max_tx_duration',
+    query: (s) => `max by (instance) (${sel('pg_stat_activity_max_tx_duration', hostOrAll(s))})`, limit: 300, unit: 's', labels: ['instance'],
+    describe: (n) => `A transaction has been open for over 5 minutes on ${n} PostgreSQL server${n > 1 ? 's' : ''} (it holds locks and blocks vacuum):`,
+  }),
+  threshold({
+    key: 'pg_top_queries', title: 'PostgreSQL queries taking the most time', group: 'databases', requires: 'pg_stat_statements_seconds_total',
+    query: (s) => `topk(5, sum by (instance, datname, queryid) (rate(${sel('pg_stat_statements_seconds_total', hostOrAll(s))}[15m])))`,
+    limit: 0.05, unit: 's/s', labels: ['instance', 'datname', 'queryid'],
+    describe: (n) => `${n} quer${n > 1 ? 'ies take' : 'y takes'} most of the database's time (seconds of execution per second, last 15 min; queryid is pg_stat_statements'):`,
+  }),
+  threshold({
+    key: 'mysql_connections', title: 'MySQL connections used', group: 'databases', requires: 'mysql_global_variables_max_connections',
+    query: (s) => `100 * max by (instance) (${sel('mysql_global_status_threads_connected', hostOrAll(s))}) / on (instance) max by (instance) (${sel('mysql_global_variables_max_connections', hostOrAll(s))})`,
+    limit: 80, unit: '%', labels: ['instance'], describe: (n) => `MySQL above 80% of max_connections on ${n} server${n > 1 ? 's' : ''}:`,
+  }),
+  threshold({
+    key: 'mysql_replica_lag', title: 'MySQL replica lag', group: 'databases', requires: 'mysql_slave_status_seconds_behind_master',
+    query: (s) => `max by (instance) (${sel('mysql_slave_status_seconds_behind_master', hostOrAll(s))})`, limit: 30, unit: 's', labels: ['instance'],
+    describe: (n) => `${n} MySQL replica${n > 1 ? 's are' : ' is'} more than 30 s behind:`,
+  }),
+  threshold({
+    key: 'redis_memory', title: 'Redis memory used (of maxmemory)', group: 'databases', requires: 'redis_memory_max_bytes',
+    query: (s) => `100 * max by (instance) (${sel('redis_memory_used_bytes', hostOrAll(s))}) / on (instance) max by (instance) (${sel('redis_memory_max_bytes', hostOrAll(s))} > 0)`,
+    limit: 85, unit: '%', labels: ['instance'], describe: (n) => `Redis above 85% of maxmemory on ${n} server${n > 1 ? 's' : ''} (it evicts keys or refuses writes at 100%):`,
+  }),
+  threshold({
+    key: 'redis_evictions', title: 'Redis evictions', group: 'databases', requires: 'redis_evicted_keys_total',
+    query: (s) => `sum by (instance) (rate(${sel('redis_evicted_keys_total', hostOrAll(s))}[5m]))`, limit: 1, unit: '/s', labels: ['instance'],
+    describe: (n) => `Redis evicting keys on ${n} server${n > 1 ? 's' : ''} (lookups miss and fall through to the database):`,
+  }),
+];
+
 export const LOG_CHECKS: CheckDef[] = [
   {
     key: 'log_errors',
@@ -466,14 +525,15 @@ export const LOG_CHECKS: CheckDef[] = [
         signal,
         timeoutMs: 15_000,
       });
-      const lines = 'error' in r ? [] : ((r.json as { data?: { result?: Array<{ values: Array<[string, string]> }> } }).data?.result ?? []).flatMap((s) => s.values.map((v) => v[1]));
-      const groups = clusterLogLines(lines).slice(0, 6);
+      const lines = 'error' in r ? [] : ((r.json as { data?: { result?: Array<{ values: Array<[string, string]> }> } }).data?.result ?? []).flatMap((s) => s.values.map((v) => ({ line: v[1], ts: Number(v[0].slice(0, 13)) })));
+      // Five 3-minute buckets: a pattern only in the last one is new, one far above its own average is spiking.
+      const groups = drainPatterns(lines, { buckets: 5, start: end - 15 * 60_000, end }).slice(0, 6);
       const jump = before ? now / before : Infinity;
       return {
-        status: jump >= 2 || !before ? 'interesting' : 'normal',
+        status: jump >= 2 || !before || groups.some((g) => g.isNew || g.spiking) ? 'interesting' : 'normal',
         summary:
-          `${now} error lines in the last 15 minutes (${before ? `${fmt(jump)}x the 15 minutes before` : 'none in the 15 minutes before'}). Most common:\n` +
-          groups.map((g) => `${g.count}x ${g.template}`).join('\n'),
+          `${now} error lines in the last 15 minutes (${before ? `${fmt(jump)}x the 15 minutes before` : 'none in the 15 minutes before'}). Most telling patterns (counts per 3 minutes):\n` +
+          groups.map(patternLine).join('\n'),
         query: stream,
         data: groups,
       };
@@ -522,7 +582,7 @@ export const LOG_CHECKS: CheckDef[] = [
   },
 ];
 
-export const ALL_CHECKS: CheckDef[] = [...METRIC_CHECKS, ...STACK_CHECKS, ...LOG_CHECKS];
+export const ALL_CHECKS: CheckDef[] = [...METRIC_CHECKS, ...DATABASE_CHECKS, ...STACK_CHECKS, ...LOG_CHECKS];
 
 export interface EvidenceItem extends CheckOutcome {
   check: string;
@@ -543,7 +603,7 @@ export async function runChecks(
 ): Promise<EvidenceItem[]> {
   const defs = opts.stack
     ? [...STACK_CHECKS, ...METRIC_CHECKS.filter((c) => c.key === 'targets_down' || c.key === 'related_alerts')]
-    : [...METRIC_CHECKS, ...LOG_CHECKS];
+    : [...METRIC_CHECKS, ...DATABASE_CHECKS, ...LOG_CHECKS];
   const jobs: Array<() => Promise<EvidenceItem>> = [];
   for (const conn of connections) {
     for (const def of defs) {
@@ -569,9 +629,11 @@ export async function runChecks(
       }
     }),
   );
-  // Interesting first, then normal; unavailable last.
+  // Interesting first, then normal; unavailable last. What an optional collector would
+  // measure, when the collector is not there at all, is not news: left out, not listed as missing.
+  const dbKeys = new Set(DATABASE_CHECKS.map((c) => c.key));
   const order: Record<EvidenceStatus, number> = { interesting: 0, error: 1, normal: 2, unavailable: 3 };
-  return results.sort((a, b) => order[a.status] - order[b.status]);
+  return results.filter((r) => !(dbKeys.has(r.check) && r.status === 'unavailable')).sort((a, b) => order[a.status] - order[b.status]);
 }
 
 /** The scope of an incident, from its alerts' labels. */

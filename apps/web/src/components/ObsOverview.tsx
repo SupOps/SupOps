@@ -161,6 +161,8 @@ function NeedRow({ i, quiet }: { i: Incident; quiet?: boolean }) {
               {v.label}
             </span>
             <span className="line-clamp-2 text-[14px] font-medium text-ink sm:line-clamp-1">{i.title}</span>
+            {i.acknowledgedAt && <span className="chip whitespace-nowrap border border-green/40 bg-green/10 text-green" title="Someone is on it">Acknowledged</span>}
+            {i.assigneeName && <span className="whitespace-nowrap text-[11px] text-muted">· {i.assigneeName}</span>}
           </div>
           <p className="mt-1 line-clamp-1 text-[12.5px] text-muted">
             {i.rootCause ? plain(i.rootCause) : verdictOf(i) === 'checking' ? 'Gathering evidence and finding the cause…' : v.hint}

@@ -30,8 +30,9 @@ const { cleanupObservability } = await import('@supops/core');
 let firing: Array<Record<string, unknown>> = [];
 /** The disk the fake backend reports: free bytes now, and losing this many per second. */
 let disk = { now: 20e9, perSecond: -1e9 / 3600 };
-/** A disk-usage percent the fake backend reports: level now, and this trend per hour. */
-let pct = { now: 50, perHour: 0 };
+/** A disk-usage percent the fake backend reports: level now, trend per hour, and an
+ * optional step change `dropHoursAgo` from `prev` (history reads `prev` before the step). */
+let pct: { now: number; perHour: number; prev?: number; dropHoursAgo?: number } = { now: 50, perHour: 0 };
 const vector = (v: number) => ({ status: 'success', data: { resultType: 'vector', result: [{ metric: { instance: 'web-1:9100', mountpoint: '/var' }, value: [0, String(v)] }] } });
 let server: Server;
 let base = '';
@@ -57,7 +58,12 @@ before(async () => {
         const end = Number(url.searchParams.get('end'));
         const step = Number((url.searchParams.get('step') ?? '3600s').replace('s', '')) || 3600;
         const values: Array<[number, string]> = [];
-        for (let t = start; t <= end; t += step) values.push([t, String(pct.now - pct.perHour * ((end - t) / 3600))]);
+        for (let t = start; t <= end; t += step) {
+          const hoursAgo = (end - t) / 3600;
+          // A realistic step change: the old level until `dropHoursAgo`, then the new one.
+          const v = pct.dropHoursAgo != null && hoursAgo > pct.dropHoursAgo ? pct.prev! : pct.now - pct.perHour * hoursAgo;
+          values.push([t, String(v)]);
+        }
         return send({ status: 'success', data: { resultType: 'matrix', result: [{ metric, values }] } });
       }
       if (url.pathname === '/api/v1/query') {
@@ -245,9 +251,10 @@ test('a cleaned-up percent signal drops its stale forecast, not "reaches its lim
     'a forecast observation is open',
   );
 
-  // Cleaned up to 34.5% minutes later. The model from the last hour is now stale; the next
-  // scan must refit it, not keep pinning "reaches its limit now" on a series with 45% headroom.
-  pct = { now: 34.5, perHour: 0 };
+  // Cleaned up to 34.5% an hour later, as a sharp cliff: the history is high for days and
+  // then drops. The model from the last hour is now stale; the next scan must refit it and
+  // read the new level, not keep pinning "reaches its limit now" on a series with 45% headroom.
+  pct = { now: 34.5, perHour: 0, prev: 79, dropHoursAgo: 1 };
   await sampleWatch(db.select().from(watches).where(eq(watches.id, w.id)).get()!, conn, Date.now() + 5 * 60_000);
 
   const r2 = db.select().from(watchSeries).where(eq(watchSeries.watchId, w.id)).get()!;

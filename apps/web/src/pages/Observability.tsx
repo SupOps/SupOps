@@ -14,8 +14,12 @@ import type { Incident, ObsConnection, Observation, ObservabilityOverview, Watch
 import { SignalsView } from '../components/SignalsView';
 import { ObsOverview, plain } from '../components/ObsOverview';
 import { ORIGIN_LABEL, VERDICT, verdictOf } from '../lib/observe-ui';
+import { useLivePoll } from '../lib/live';
+import { ChangeList } from '../components/Changes';
+import { ErrorList } from '../components/Errors';
+import { LogPatterns } from '../components/LogPatterns';
 
-type Tab = 'overview' | 'incidents' | 'signals';
+type Tab = 'overview' | 'incidents' | 'signals' | 'changes' | 'errors' | 'logs';
 
 const SEV_DOT: Record<string, string> = { critical: 'bg-red', warning: 'bg-amber', info: 'bg-cyan', unknown: 'bg-dim' };
 const SEV_TEXT: Record<string, string> = { critical: 'text-red', warning: 'text-amber', info: 'text-cyan', unknown: 'text-muted' };
@@ -30,7 +34,7 @@ export function Observability() {
     queryKey: ['obs', projectId],
     queryFn: () => api<ObservabilityOverview>(`/observability/overview?projectId=${projectId}`),
     enabled: !!projectId,
-    refetchInterval: 10_000,
+    refetchInterval: useLivePoll(10_000),
   });
 
   const stack = useMutation({
@@ -61,10 +65,16 @@ export function Observability() {
             { value: 'overview', label: 'Overview' },
             { value: 'incidents', label: 'Incidents' },
             { value: 'signals', label: 'Signals' },
+            { value: 'changes', label: 'Changes' },
+            { value: 'errors', label: 'Errors' },
+            { value: 'logs', label: 'Logs' },
           ]}
         />
         {stack.isError && <p className="text-sm text-red">{(stack.error as Error).message}</p>}
-        {overview.isLoading ? (
+        {tab === 'changes' ? (
+          // Changes come from CI and SupOps itself too: they need no connection.
+          <ChangeList projectId={projectId!} />
+        ) : overview.isLoading ? (
           <div className="grid place-items-center py-16"><Spinner /></div>
         ) : !conns.length ? (
           <Panel>
@@ -75,6 +85,10 @@ export function Observability() {
               action={<Link to="/targets" className="btn-primary">Add a connection</Link>}
             />
           </Panel>
+        ) : tab === 'logs' ? (
+          <LogPatterns projectId={projectId!} connections={conns} />
+        ) : tab === 'errors' ? (
+          <ErrorList projectId={projectId!} />
         ) : tab === 'incidents' ? (
           <IncidentList projectId={projectId!} />
         ) : tab === 'signals' ? (
@@ -98,6 +112,8 @@ export function IncidentRow({ incident: i }: { incident: Incident }) {
           <div className="flex flex-wrap items-center gap-2">
             {i.status === 'open' && <span className={clsx('chip whitespace-nowrap', v.chip)} title={v.hint}>{v.label}</span>}
             <span className="truncate text-sm font-medium text-ink">{i.title}</span>
+            {i.acknowledgedAt && <span className="chip whitespace-nowrap border border-green/40 bg-green/10 text-green" title="Someone is on it">Acknowledged</span>}
+            {i.assigneeName && <span className="whitespace-nowrap text-[11px] text-muted">· {i.assigneeName}</span>}
           </div>
           <div className="mt-0.5 truncate text-xs text-muted">
             {i.status === 'ignored' ? (
@@ -124,7 +140,7 @@ function IncidentList({ projectId }: { projectId: string }) {
   const list = useQuery({
     queryKey: ['incidents', projectId, status],
     queryFn: () => api<Incident[]>(`/observability/incidents?projectId=${projectId}&status=${status}`),
-    refetchInterval: 10_000,
+    refetchInterval: useLivePoll(10_000),
   });
   const title = { open: 'Open incidents', ignored: 'Ignored incidents', resolved: 'Resolved incidents' }[status];
   const empty = {
@@ -190,13 +206,15 @@ function WatchForm({ projectId, connections, existing, onDone }: { projectId: st
     badDirection: existing?.badDirection ?? ('up' as 'up' | 'down' | 'both'),
     limit: existing?.limit ? String(existing.limit.value) : '',
     when: existing?.limit?.when ?? ('below' as 'below' | 'above'),
+    adaptive: existing?.adaptive ? String(existing.adaptive.iqrs) : '',
   });
   const limit = form.limit.trim() ? { value: Number(form.limit), when: form.when } : null;
+  const adaptive = form.adaptive ? { iqrs: Number(form.adaptive) } : null;
   const save = useMutation({
     mutationFn: () =>
       existing
-        ? patch<{ reevaluated: boolean; error?: string }>(`/observability/watches/${existing.id}`, { title: form.title, query: form.query, unit: form.unit, badDirection: form.badDirection, limit })
-        : post('/observability/watches', { projectId, connectionId: form.connectionId, title: form.title, query: form.query, unit: form.unit, badDirection: form.badDirection, limit }),
+        ? patch<{ reevaluated: boolean; error?: string }>(`/observability/watches/${existing.id}`, { title: form.title, query: form.query, unit: form.unit, badDirection: form.badDirection, limit, adaptive })
+        : post('/observability/watches', { projectId, connectionId: form.connectionId, title: form.title, query: form.query, unit: form.unit, badDirection: form.badDirection, limit, adaptive }),
     onSuccess: (r) => {
       void qc.invalidateQueries({ queryKey: ['watches', projectId] });
       void qc.invalidateQueries({ queryKey: ['watch'] });
@@ -241,6 +259,14 @@ function WatchForm({ projectId, connections, existing, onDone }: { projectId: st
             </select>
             <input className="input font-mono" inputMode="decimal" value={form.limit} placeholder="e.g. 0" onChange={set('limit')} />
           </div>
+        </Field>
+        <Field label="Self-adjusting threshold" hint="Each series learns its own limit from its last 7 days (its 99th percentile, plus a margin of its usual spread) and relearns it daily. 3 of 5 minutes past it raise an alert.">
+          <select className="input" value={form.adaptive} onChange={set('adaptive')}>
+            <option value="">Off</option>
+            <option value="1">On, tight (1x spread)</option>
+            <option value="2">On (2x spread)</option>
+            <option value="3">On, loose (3x spread)</option>
+          </select>
         </Field>
       </div>
       {save.isError && <p className="mt-3 text-sm text-red">{(save.error as Error).message}</p>}

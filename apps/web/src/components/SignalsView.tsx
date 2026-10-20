@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { clsx } from 'clsx';
-import { Activity, AlertTriangle, ArrowLeft, ChevronDown, Container, Cpu, Pencil, Plus, RadioTower, Search, SlidersHorizontal, X } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowLeft, ChevronDown, Container, Cpu, Pencil, Plus, RadioTower, Search, SlidersHorizontal, X, Database } from 'lucide-react';
 import { formatValue } from '@supops/shared';
 import { api, patch, post } from '../lib/api';
 import { Empty, Panel, Segmented, Spinner, Switch } from './ui';
@@ -22,6 +22,7 @@ const GROUPS: Array<{ key: Watch['group']; label: string; icon: typeof Cpu }> = 
   { key: 'resources', label: 'Resources', icon: Cpu },
   { key: 'kubernetes', label: 'Kubernetes', icon: Container },
   { key: 'traffic', label: 'Traffic', icon: Activity },
+  { key: 'databases', label: 'Databases', icon: Database },
   { key: 'stack', label: 'Monitoring stack', icon: RadioTower },
 ];
 const GROUP_LABEL = Object.fromEntries(GROUPS.map((g) => [g.key, g.label])) as Record<Watch['group'], string>;
