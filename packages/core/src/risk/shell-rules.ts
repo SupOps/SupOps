@@ -821,6 +821,13 @@ const DOCKER_READ = new Set([
   'diff', 'history', 'events', 'search',
 ]);
 
+/** Management nouns in `docker <noun> <subcommand>` (the modern form of the verbs above). */
+const DOCKER_NOUNS = new Set(['image', 'container', 'volume', 'network', 'system', 'node', 'service', 'context', 'builder', 'buildx', 'plugin', 'manifest', 'trust', 'config', 'secret', 'swarm', 'stack', 'checkpoint']);
+/** Nouns whose changes hit shared infrastructure, so a change there is high, not medium. */
+const DOCKER_INFRA_NOUNS = new Set(['volume', 'network', 'system', 'node', 'service', 'swarm', 'secret', 'config']);
+/** Subcommands that only read, under any management noun. */
+const DOCKER_READ_SUB = new Set(['ls', 'list', 'inspect', 'ps', 'logs', 'stats', 'top', 'history', 'df', 'info', 'events', 'version', 'port', 'diff']);
+
 /** docker global flags that take a value, so `docker -H tcp://x ps` reads as verb `ps`. */
 const DOCKER_VALUE_FLAGS = ['-H', '--host', '--context', '--config', '--log-level', '-l'];
 
@@ -864,12 +871,16 @@ function classifyDocker(cmd: SimpleCommand, target: ResolvedTarget): RuleHit {
   if (['rm', 'rmi', 'kill'].includes(verb)) {
     return hit(`shell.docker.${verb}`, 'high', `docker ${verb} destroys a container or image`);
   }
-  if (['volume', 'network', 'system'].includes(verb)) {
+  // Modern management form: `docker <noun> <subcommand>`, e.g. `docker image ls`,
+  // `docker container inspect`, `docker volume rm`. Read-only subcommands only read;
+  // destructive ones delete in bulk; exec opens a shell; the rest change something.
+  if (DOCKER_NOUNS.has(verb)) {
     const sub = args[1];
-    if (sub === 'ls' || sub === 'inspect') {
-      return hit(`shell.docker.${verb}.read`, 'read_only', `docker ${verb} ${sub} only reads`);
-    }
-    return hit(`shell.docker.${verb}`, 'high', `docker ${verb} ${sub ?? ''} changes shared infrastructure`);
+    if (sub && DOCKER_READ_SUB.has(sub)) return hit(`shell.docker.${verb}.read`, 'read_only', `docker ${verb} ${sub} only reads`);
+    if (sub && ['rm', 'rmi', 'remove', 'prune', 'kill'].includes(sub)) return hit(`shell.docker.${verb}.${sub}`, 'high', `docker ${verb} ${sub} destroys ${verb}s`);
+    if (sub === 'exec') return hit(`shell.docker.${verb}.exec`, 'high', `docker ${verb} exec opens an unreviewable shell in a container`);
+    const infra = DOCKER_INFRA_NOUNS.has(verb);
+    return hit(`shell.docker.${verb}`, infra ? 'high' : 'medium', `docker ${verb} ${sub ?? ''} changes ${infra ? 'shared infrastructure' : 'what is running'}`);
   }
   if (['start', 'restart', 'stop', 'pause', 'unpause', 'cp', 'update', 'rename', 'run', 'create'].includes(verb)) {
     return hit(`shell.docker.${verb}`, 'medium', `docker ${verb} changes what is running`);

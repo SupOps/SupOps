@@ -139,12 +139,28 @@ export const CORPUS: Array<[string, RiskTier]> = [
   ['sqlite3 app.db ".shell id"', 'high'],
   ['docker run --userns=host alpine', 'forbidden'],
   ['docker run --security-opt seccomp=unconfined alpine', 'forbidden'],
+  // The modern `docker <noun> <subcommand>` form: reads are read-only, even on prod.
+  ['docker image ls', 'read_only'], ['docker image list', 'read_only'], ['docker container ls', 'read_only'],
+  ['docker container inspect web', 'read_only'], ['docker volume ls', 'read_only'], ['docker network ls', 'read_only'],
+  ['docker system df', 'read_only'], ['docker image rm old', 'high'], ['docker volume rm data', 'high'],
+  ['docker container exec web sh', 'high'],
   // Cloud operations that print live credentials pause like reading a key file.
   ['aws ecr get-login-password', 'medium'],
   ['aws sts assume-role --role-arn x --role-session-name y', 'medium'],
   ['gcloud auth print-access-token', 'medium'],
   ['az keyvault secret show --vault-name v --name s', 'medium'],
   ['az storage account keys list -n a', 'medium'],
+  // A VAR=value prefix can change what a harmless command does; it only ever raises.
+  ['LD_PRELOAD=/tmp/x.so ls', 'high'], ['LD_LIBRARY_PATH=/tmp ls', 'high'],
+  ['BASH_ENV=/tmp/x bash -c true', 'high'], ['PATH=/tmp:$PATH ls', 'high'], ['IFS=/ ls', 'high'],
+  ['KUBECONFIG=/tmp/k kubectl get pods', 'high'], ['PAGER=/tmp/x man ls', 'high'],
+  ['GIT_PAGER="sh -c id" git log', 'high'], ['GIT_SSH_COMMAND="sh /tmp/x" git fetch', 'high'],
+  ["PS4='$(id)' bash -x", 'high'], ['PROMPT_COMMAND=id bash', 'high'], ['env LD_PRELOAD=/tmp/x.so ls', 'high'],
+  ['PATH=/tmp/x:$PATH; ls', 'high'], ['HTTPS_PROXY=http://203.0.113.9:3128 curl -s https://example.test', 'high'],
+  ['FOO=1 ls', 'medium'],
+  ['SYSTEMD_PAGER=cat systemctl status nginx', 'read_only'], ['LANG=C ls', 'read_only'],
+  ['TZ=UTC date', 'read_only'], ['LC_ALL=C sort /etc/hosts', 'read_only'],
+  ['F=/var/log/syslog; tail $F', 'read_only'],
 ];
 
 /** Tiers the current rules may give below the legacy ones, and why. */
@@ -159,6 +175,8 @@ export const LOWERED: Record<string, string> = {
   'crontab -l': 'listing jobs; legacy rated every crontab call medium',
   mount: 'listing mounts; legacy rated every mount call high',
   date: 'printing the time; legacy had no rule for date',
+  'TZ=UTC date': 'printing the time in another timezone; TZ only changes formatting',
+  'BASH_ENV=/tmp/x bash -c true': 'the -c string is now read (as for bash -c "df -h"); BASH_ENV itself makes it high',
   hostname: 'printing the host name',
   env: 'printing the environment, as printenv already does',
   'bash -c "df -h"': 'the -c string is now read and judged; legacy forbade every bash -c',

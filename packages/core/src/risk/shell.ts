@@ -1,11 +1,12 @@
 import type { RiskContribution, RiskTier } from '@supops/shared';
 import { maxTier } from '@supops/shared';
 import type { ResolvedTarget } from '../tools/types.ts';
-import { lexShell } from './shell-lex.ts';
+import { lexShell, splitOnControlOperators } from './shell-lex.ts';
 import type { RuleHit } from './rule-kit.ts';
 import { categoryFor, hit, registerLineClassifier, worst } from './rule-kit.ts';
 import { classifyRedirectsActive, classifySimpleCommand, classifyWholeLine, riskRulesMode } from './shell-rules.ts';
 import { classifyLine } from './rules-line.ts';
+import { classifyAssignments } from './rules-env.ts';
 
 /** A rule's verdict as an audit-trail entry, carrying the kind of harm when known. */
 function contribution(h: RuleHit): RiskContribution {
@@ -58,12 +59,27 @@ export function classifyShellCommand(
         `could not safely read this command (${lexed.reason}); ` +
         `unreadable commands are treated as high risk. Split it into separate steps.`,
     });
+    // One unreadable part must not hide another: `kill -9 1; X='$(id)' cmd` is still
+    // forbidden. Each part is judged on its own as well, and the worst one counts.
+    const parts = splitOnControlOperators(command.trim());
+    if (parts && parts.length > 1) {
+      for (const p of parts) {
+        const v = classifyShellCommand(p.text, target);
+        contributions.push(...v.contributions.filter((c) => c.ruleId !== 'shell.unparseable'));
+      }
+    }
     return { tier: maxTier('high', ...contributions.map((c) => c.tier)), contributions };
   }
+
+  // Variables that change what a command does (LD_PRELOAD, PATH, KUBECONFIG...): raise only.
+  const statements = lexed.assignments ? classifyAssignments(lexed.assignments, 'the rest of the line', true) : null;
+  if (statements) contributions.push(contribution(statements));
 
   for (const cmd of lexed.commands) {
     const verdict = classifySimpleCommand(cmd, target);
     contributions.push(contribution(verdict));
+    const env = cmd.env ? classifyAssignments(cmd.env, cmd.name) : null;
+    if (env) contributions.push(contribution(env));
 
     const redirect = classifyRedirectsActive(cmd, target);
     if (redirect) {

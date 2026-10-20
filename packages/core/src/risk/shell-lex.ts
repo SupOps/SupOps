@@ -40,6 +40,8 @@ export interface SimpleCommand {
   heredoc?: string;
   /** Working directory, when a `cd` earlier in the line made it knowable. */
   cwd?: string | null;
+  /** Leading `VAR=value` assignments: the environment of this one command. */
+  env?: Array<[string, string]>;
   /** First / last command of a `( ... )` subshell, whose `cd` does not leak out. */
   subshellOpen?: boolean;
   subshellClose?: boolean;
@@ -74,6 +76,8 @@ export interface LexFailure {
 export interface LexSuccess {
   ok: true;
   commands: SimpleCommand[];
+  /** Bare `VAR=value` statements, which set shell variables for the rest of the line. */
+  assignments?: Array<[string, string]>;
 }
 export type LexResult = LexSuccess | LexFailure;
 
@@ -97,10 +101,12 @@ export function lexShell(input: string): LexResult {
   // `VAR=value` assignments earlier in the line, so `F=/etc/shadow; cat $F` is read
   // as what it is.
   const vars = new Map<string, string>();
+  const assignments: Array<[string, string]> = [];
   for (const seg of segments) {
     const parsed = parseSimpleCommand(seg, vars);
     if (!parsed.ok) return parsed;
     if (parsed.command) commands.push(parsed.command);
+    if (parsed.assigned) assignments.push(...parsed.assigned);
   }
 
   if (commands.length === 0) return { ok: false, reason: 'no command found' };
@@ -108,7 +114,7 @@ export function lexShell(input: string): LexResult {
   for (let i = 1; i < commands.length; i += 1) {
     if (commands[i - 1]!.pipedInto) commands[i]!.pipedFrom = true;
   }
-  return { ok: true, commands };
+  return { ok: true, commands, ...(assignments.length ? { assignments } : {}) };
 }
 
 interface Segment {
@@ -126,7 +132,7 @@ interface Segment {
  * redirect (`2>&1`, `&>file`, `>&2`) is not a control operator. Heredoc bodies are
  * captured whole rather than read as commands. Returns null on unbalanced quotes.
  */
-function splitOnControlOperators(input: string): Segment[] | null {
+export function splitOnControlOperators(input: string): Segment[] | null {
   const segments: Segment[] = [];
   let buf = '';
   let quote: "'" | '"' | null = null;
@@ -327,7 +333,7 @@ function substitute(word: string, vars: Map<string, string>): string {
 function parseSimpleCommand(
   seg: Segment,
   vars: Map<string, string>,
-): { ok: true; command: SimpleCommand | null } | LexFailure {
+): { ok: true; command: SimpleCommand | null; assigned?: Array<[string, string]> } | LexFailure {
   const tokens = tokenize(seg.text);
   if (!tokens) return { ok: false, reason: 'unbalanced quotes in command' };
   if (tokens.length === 0) return { ok: true, command: null };
@@ -357,8 +363,9 @@ function parseSimpleCommand(
       if (!tok.quoted && (['for', 'case', 'select', 'function', 'coproc'].includes(tok.raw) || /\(\)$/.test(tok.raw))) {
         return { ok: false, reason: `"${tok.raw}" starts a loop, case statement or function, which cannot be read statically` };
       }
-      // Leading VAR=value assignments, then the real command.
-      if (!tok.quoted && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tok.raw)) {
+      // Leading VAR=value assignments, then the real command. The raw text must start
+      // with a plain name and `=`; the value may be quoted (GIT_PAGER="less -R").
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok.raw)) {
         const eq = tok.value.indexOf('=');
         assigned.push([tok.value.slice(0, eq), substitute(tok.value.slice(eq + 1), vars)]);
         continue;
@@ -399,7 +406,7 @@ function parseSimpleCommand(
   if (name === null) {
     // A bare assignment segment defines variables for the rest of the line.
     for (const [k, v] of assigned) vars.set(k, v);
-    return { ok: true, command: null };
+    return { ok: true, command: null, ...(assigned.length ? { assigned } : {}) };
   }
   return {
     ok: true,
@@ -409,6 +416,7 @@ function parseSimpleCommand(
       redirects,
       raw: seg.text,
       pipedInto: seg.pipedInto,
+      ...(assigned.length ? { env: assigned } : {}),
       ...(seg.background ? { background: true } : {}),
       ...(seg.heredoc !== undefined ? { heredoc: seg.heredoc } : {}),
       ...(seg.subshellOpen ? { subshellOpen: true } : {}),

@@ -1,5 +1,5 @@
 import type { RiskAssessment, RiskContribution, RiskTier } from '@supops/shared';
-import { autoCeiling, isApprovable, maxTier, tierAtMost } from '@supops/shared';
+import { autoCeiling, isApprovable, maxTier, tierAtMost, tierRank } from '@supops/shared';
 import type { RiskPolicy } from '@supops/db';
 import type { ResolvedTarget, ToolDef } from '../tools/types.ts';
 import { classifyShellCommand } from './shell.ts';
@@ -25,6 +25,17 @@ export interface AssessInput {
   modelHint?: RiskTier | undefined;
   /** How the run was started (chat, alert, health...): some triggers cap autonomy. */
   trigger?: string;
+  /** Rules learned from earlier runs, and this call's signature. Raise-only. */
+  learned?: { signature: string | null; rules: LearnedRuleView[] };
+}
+
+export interface LearnedRuleView {
+  id: string;
+  signature: string;
+  targetId: string | null;
+  effect: 'raise' | 'block';
+  minTier: RiskTier;
+  reason: string;
 }
 
 /**
@@ -63,7 +74,23 @@ export function assessRisk(input: AssessInput): RiskAssessment {
   const envBump = targetBump(target, preTarget);
   if (envBump) contributions.push(envBump);
 
-  // 4. Model self-assessment -- advisory, raise-only.
+  // 4. What earlier runs taught: a matching learned rule can only raise the tier (or
+  //    block). Rules come from recorded denials and failures, never from model text.
+  //    SUPOPS_LEARNED_RULES=off is the kill switch.
+  if (input.learned?.signature && process.env.SUPOPS_LEARNED_RULES !== 'off') {
+    for (const r of input.learned.rules) {
+      if (r.signature !== input.learned.signature) continue;
+      if (r.targetId && r.targetId !== target.id) continue;
+      contributions.push({
+        stage: 'learned',
+        tier: r.effect === 'block' ? 'forbidden' : r.minTier,
+        ruleId: `learned.${r.id}`,
+        reason: r.reason,
+      });
+    }
+  }
+
+  // 5. Model self-assessment -- advisory, raise-only.
   if (modelHint && modelHint !== 'read_only') {
     contributions.push({
       stage: 'model',
@@ -80,6 +107,26 @@ export function assessRisk(input: AssessInput): RiskAssessment {
       ? 'auto'
       : 'approve';
   return { tier, contributions, decision, ceiling: ceiling.tier, ceilingReason: ceiling.reason };
+}
+
+/**
+ * Fold the `observed` contributions from a shadow run into an assessment. Like every
+ * other stage it only RAISES: the new tier is the max over the larger set, so a clean
+ * simulation can never unlock an action (sandbox-aware malware could behave nicely
+ * under observation, so we never reward a quiet run). The decision is re-derived
+ * against the same ceiling the assessment already carries.
+ */
+export function withObservations(base: RiskAssessment, observed: RiskContribution[]): RiskAssessment {
+  const raising = observed.filter((c) => tierRank(c.tier) > 0);
+  if (!raising.length) return base;
+  const contributions = [...base.contributions, ...raising];
+  const tier = maxTier(...contributions.map((c) => c.tier));
+  const decision: RiskAssessment['decision'] = !isApprovable(tier)
+    ? 'block'
+    : base.ceiling && tierAtMost(tier, base.ceiling)
+      ? 'auto'
+      : 'approve';
+  return { ...base, tier, contributions, decision };
 }
 
 /**
