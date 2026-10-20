@@ -116,3 +116,21 @@ function walk(start: string, links: GraphLink[], maxDepth: number, mode: 'impact
 export const TYPE_TIER: Record<CiType, number> = {
   external: 0, gateway: 0, load_balancer: 1, service: 2, monitoring: 2, cluster: 3, queue: 3, cache: 3, database: 4, storage: 4, host: 5, other: 2,
 };
+
+/**
+ * Of the components with a problem, which are likeliest the origin: those none of whose
+ * dependencies (up to `maxDepth` steps, by how failure flows) also has a problem. The
+ * others are probably its effects. (Dynatrace's rule: the root cause is the most upstream
+ * abnormal component; a symptom downstream of it is never the cause.)
+ */
+export function likelyOrigins(abnormal: Iterable<string>, links: GraphLink[], maxDepth = 4): { origins: string[]; effects: Array<{ id: string; dependsOn: string }> } {
+  const bad = new Set(abnormal);
+  const origins: string[] = [];
+  const effects: Array<{ id: string; dependsOn: string }> = [];
+  for (const id of bad) {
+    const dep = dependenciesOf(id, links, maxDepth).find((d) => bad.has(d.id) && d.id !== id);
+    if (dep) effects.push({ id, dependsOn: dep.id });
+    else origins.push(id);
+  }
+  return { origins, effects };
+}

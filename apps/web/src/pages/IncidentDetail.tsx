@@ -2,13 +2,14 @@ import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { clsx } from 'clsx';
-import { ArrowLeft, ChevronDown, ExternalLink, EyeOff, GitMerge, Play, RefreshCw, RotateCcw, Scissors, ShieldCheck } from 'lucide-react';
+import { ArrowLeft, BellOff, ChevronDown, ExternalLink, EyeOff, GitMerge, MessageSquare, Play, RefreshCw, RotateCcw, Scissors, ShieldCheck } from 'lucide-react';
 import { api, post } from '../lib/api';
 import { useApp } from '../lib/store';
 import { timeAgo } from '../lib/format';
 import { Empty, Panel, Segmented, Spinner, StatusPill } from '../components/ui';
 import type { Evidence, IncidentDetail as Detail } from '../lib/types';
 import { SURE, VERDICT, verdictOf } from '../lib/observe-ui';
+import { ChangeSuspects } from '../components/Changes';
 
 const SEV_CHIP: Record<string, string> = {
   critical: 'border-red/40 bg-red/10 text-red',
@@ -60,6 +61,14 @@ export function IncidentDetail() {
   const reopen = useMutation({ mutationFn: () => post(`/observability/incidents/${id}/reopen`, {}), onSuccess: invalidate });
   const [ignoring, setIgnoring] = useState(false);
   const merge = useMutation({ mutationFn: (into: string) => post(`/observability/incidents/${id}/merge`, { into }), onSuccess: () => navigate('/observability?tab=incidents') });
+  // Merging a suggestion keeps this page: the other incident's alerts come here.
+  const absorb = useMutation({ mutationFn: (other: string) => post(`/observability/incidents/${other}/merge`, { into: id }), onSuccess: invalidate });
+  const notRelated = useMutation({ mutationFn: (other: string) => post(`/observability/incidents/${id}/not-related`, { other }), onSuccess: invalidate });
+  const acknowledge = useMutation({ mutationFn: (on: boolean) => post(`/observability/incidents/${id}/${on ? 'acknowledge' : 'unacknowledge'}`, {}), onSuccess: invalidate });
+  const assign = useMutation({ mutationFn: (userId: string | null) => post(`/observability/incidents/${id}/assign`, { userId }), onSuccess: invalidate });
+  const severity = useMutation({ mutationFn: (v: string) => post(`/observability/incidents/${id}/severity`, { severity: v }), onSuccess: invalidate });
+  const assignees = useQuery({ queryKey: ['assignees'], queryFn: () => api<Array<{ id: string; name: string }>>('/observability/assignees'), staleTime: 5 * 60_000 });
+  const me = useApp((s) => s.user);
   const [splitting, setSplitting] = useState<Set<string> | null>(null);
   const split = useMutation({
     mutationFn: () => post<{ id: string }>(`/observability/incidents/${id}/split`, { alertIds: [...(splitting ?? [])] }),
@@ -71,11 +80,11 @@ export function IncidentDetail() {
 
   if (d.isLoading) return <div className="grid place-items-center py-20"><Spinner /></div>;
   if (!d.data) return <Empty title="Incident not found" hint="It may have been cleaned up after 15 days." action={<Link className="btn-ghost" to="/observability">Back</Link>} />;
-  const { incident: inc, alerts, evidence, run, fixRun, timeline, mergeCandidates } = d.data;
+  const { incident: inc, alerts, evidence, run, fixRun, timeline, mergeCandidates, suggestions = [] } = d.data;
   const cited = evidence.filter((e) => e.ref !== '-');
   const missing = evidence.filter((e) => e.ref === '-');
   const busy = inc.triageState === 'evidence' || inc.triageState === 'running';
-  const error = [investigate, recheck, resolve, merge, split, ignore, reopen].find((m) => m.isError)?.error as Error | undefined;
+  const error = [investigate, recheck, resolve, merge, split, ignore, reopen, acknowledge, assign, severity].find((m) => m.isError)?.error as Error | undefined;
 
   return (
     <div className="mx-auto w-full max-w-4xl space-y-4 px-4 pb-10 pt-5 sm:px-6">
@@ -91,6 +100,11 @@ export function IncidentDetail() {
           {inc.origin === 'prediction' && <span className="text-xs text-amber">· forecast, nothing has failed yet</span>}
           {inc.origin === 'threshold' && <span className="text-xs text-amber">· over the limit set for it</span>}
           <span className="text-xs text-muted">· opened {timeAgo(inc.openedAt)}</span>
+          {inc.acknowledgedAt && (
+            <span className="chip border border-green/40 bg-green/10 text-green" title="Lapses by itself if the incident gets worse">
+              Acknowledged{inc.acknowledgedByName ? ` by ${inc.acknowledgedByName}` : ''} {timeAgo(inc.acknowledgedAt)}
+            </span>
+          )}
         </div>
         <h1 className="text-[22px] font-semibold leading-snug tracking-[-0.01em] text-ink">{inc.title}</h1>
         {(inc.targets.length > 0 || inc.groupReason) && (
@@ -99,7 +113,53 @@ export function IncidentDetail() {
             {inc.groupReason && <>Grouped because {inc.groupReason}.</>}
           </p>
         )}
+        <div className="flex flex-wrap items-center gap-2 pt-1 text-xs text-muted">
+          <label className="flex items-center gap-1.5">
+            <span>Owner</span>
+            <select
+              className="input !min-h-[32px] !w-auto !py-1 text-xs"
+              value={inc.assigneeId ?? ''}
+              disabled={assign.isPending}
+              onChange={(e) => assign.mutate(e.target.value || null)}
+              aria-label="Assign to"
+            >
+              <option value="">Nobody</option>
+              {me && !assignees.data?.some((u) => u.id === me.id) && <option value={me.id}>{me.name} (me)</option>}
+              {(assignees.data ?? []).map((u) => <option key={u.id} value={u.id}>{u.name}{u.id === me?.id ? ' (me)' : ''}</option>)}
+            </select>
+          </label>
+          {me && inc.assigneeId !== me.id && (
+            <button className="text-blue-text hover:underline" onClick={() => assign.mutate(me.id)} disabled={assign.isPending}>Assign to me</button>
+          )}
+          <label className="flex items-center gap-1.5">
+            <span>Severity</span>
+            <select
+              className="input !min-h-[32px] !w-auto !py-1 text-xs"
+              value={inc.severity === 'unknown' ? '' : inc.severity}
+              disabled={severity.isPending}
+              onChange={(e) => e.target.value && severity.mutate(e.target.value)}
+              aria-label="Severity"
+              title={inc.severityPinned ? 'Set by a person: new alerts no longer change it' : 'Follows its worst alert until you set it'}
+            >
+              {inc.severity === 'unknown' && <option value="">Unknown</option>}
+              <option value="critical">Critical</option>
+              <option value="warning">Warning</option>
+              <option value="info">Info</option>
+            </select>
+          </label>
+          {inc.severityPinned && <span className="text-[11px]">set by hand</span>}
+        </div>
         <div className="flex flex-wrap gap-2 pt-1">
+          {inc.status === 'open' && (
+            <button
+              className="btn-ghost !min-h-[36px]"
+              disabled={acknowledge.isPending}
+              onClick={() => acknowledge.mutate(!inc.acknowledgedAt)}
+              title={inc.acknowledgedAt ? 'Take it back: the incident is news again' : 'You are on it. It lapses by itself if the incident gets worse.'}
+            >
+              {acknowledge.isPending ? <Spinner /> : <BellOff size={14} />} {inc.acknowledgedAt ? 'Unacknowledge' : 'Acknowledge'}
+            </button>
+          )}
           {busy && run ? (
             <Link to={`/runs/${run.id}`} className="btn-primary !min-h-[36px]"><Play size={14} /> Watch the diagnosis</Link>
           ) : inc.status === 'open' || !fixRun ? (
@@ -126,6 +186,12 @@ export function IncidentDetail() {
             <button className="btn-ghost !min-h-[36px]" disabled={reopen.isPending} onClick={() => reopen.mutate()}>{reopen.isPending ? <Spinner /> : <RotateCcw size={14} />} Reopen</button>
           )}
         </div>
+        {inc.held && d.data.rule && (
+          <p className="rounded-inner border border-blue/30 bg-blue/[0.06] px-3 py-2 text-xs leading-relaxed text-muted">
+            Waiting: the rule <span className="text-ink">{d.data.rule.name}</span> shows an incident once it has {d.data.rule.threshold} alerts, and this one has {alerts.length}.
+            Until then it is not listed and not diagnosed. Its alerts are on the Alerts page.
+          </p>
+        )}
         {ignoring && <IgnoreForm busy={ignore.isPending} onCancel={() => setIgnoring(false)} onIgnore={(hours, reason) => ignore.mutate({ hours, reason })} />}
         {inc.status === 'ignored' && (
           <p className="rounded-inner border border-hairline bg-tile-2/60 px-3 py-2 text-xs leading-relaxed text-muted">
@@ -154,6 +220,8 @@ export function IncidentDetail() {
                 <span className={clsx('font-medium', CONFIDENCE[inc.confidence ?? 'low'])}>{SURE[inc.confidence ?? ''] ?? 'Certainty not stated'}</span>
                 {run && <> · <Link className="text-blue-text hover:underline" to={`/runs/${run.id}`}>full report</Link></>}
               </p>
+              <Weighed hypotheses={inc.hypotheses ?? []} />
+              {inc.blastRadius && <BlastRadius r={inc.blastRadius} />}
             </>
           ) : (
             <p className="text-sm text-muted">
@@ -166,6 +234,8 @@ export function IncidentDetail() {
           )}
         </div>
       </Panel>
+
+      <ChangeSuspects incidentId={inc.id} />
 
       {/* Evidence */}
       <Panel title="Evidence" accent="bg-amber" action={<span className="text-[11px] text-muted">{cited.filter((e) => e.status === 'interesting').length} of {cited.length} notable</span>}>
@@ -258,6 +328,21 @@ export function IncidentDetail() {
           ) : (
             <p className="px-5 pb-4 text-sm text-muted">{inc.origin === 'prediction' ? 'Raised by a forecast, before any alert fired.' : 'No alerts.'}</p>
           )}
+          {suggestions.length > 0 && inc.status === 'open' && (
+            <div className="space-y-2 border-t border-hairline px-5 py-3">
+              <p className="text-[11px] font-medium uppercase tracking-wide text-muted">Possibly the same problem</p>
+              {suggestions.map((sg) => (
+                <div key={sg.id} className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-inner border border-hairline bg-tile-2/40 px-3 py-2">
+                  <div className="min-w-0 flex-1">
+                    <Link to={`/observability/incidents/${sg.id}`} className="text-[13px] text-ink hover:underline">{sg.title}</Link>
+                    <p className="text-[11px] text-muted">{sg.reason}</p>
+                  </div>
+                  <button className="btn-ghost !min-h-[30px] !text-xs" disabled={absorb.isPending} onClick={() => absorb.mutate(sg.id)}><GitMerge size={13} /> Merge into this one</button>
+                  <button className="btn-ghost !min-h-[30px] !text-xs" disabled={notRelated.isPending} onClick={() => notRelated.mutate(sg.id)}>Not related</button>
+                </div>
+              ))}
+            </div>
+          )}
           {mergeCandidates.length > 0 && inc.status === 'open' && (
             <div className="flex items-center gap-2 border-t border-hairline px-5 py-2.5">
               <GitMerge size={13} className="shrink-0 text-muted" />
@@ -271,12 +356,13 @@ export function IncidentDetail() {
 
         {/* Timeline */}
         <Panel title="Timeline" accent="bg-cyan">
+          <CommentBox incidentId={inc.id} onAdded={invalidate} />
           <ol className="relative space-y-3 border-t border-hairline px-5 pb-5 pt-4">
             {timeline.map((t, i) => (
               <li key={i} className="relative pl-4">
-                <span className={clsx('absolute left-0 top-1.5 h-1.5 w-1.5 rounded-full', t.kind === 'alert' ? 'bg-red' : t.kind === 'resolved' || t.kind === 'closed' ? 'bg-green' : t.kind === 'change' || t.kind === 'deploy' ? 'bg-amber' : t.kind === 'ignored' || t.kind === 'pending' ? 'bg-dim' : 'bg-blue')} />
+                <span className={clsx('absolute left-0 top-1.5 h-1.5 w-1.5 rounded-full', t.kind === 'alert' ? 'bg-red' : t.kind === 'resolved' || t.kind === 'closed' ? 'bg-green' : t.kind === 'change' || t.kind === 'deploy' ? 'bg-amber' : t.kind === 'ignored' || t.kind === 'pending' ? 'bg-dim' : t.kind === 'person' || t.kind === 'comment' ? 'bg-violet' : 'bg-blue')} />
                 {i < timeline.length - 1 && <span className="absolute left-[2.5px] top-3.5 h-[calc(100%+4px)] w-px bg-hairline" />}
-                <div className="text-[12.5px] leading-snug text-ink">{t.text}</div>
+                <div className={clsx('text-[12.5px] leading-snug text-ink', t.kind === 'comment' && 'whitespace-pre-wrap break-words rounded-inner border border-hairline bg-tile-2/60 px-2.5 py-1.5')}>{t.text}</div>
                 <div className="font-mono text-[10.5px] text-dim">{new Date(t.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</div>
               </li>
             ))}
@@ -331,5 +417,87 @@ function EvidenceRow({ e }: { e: Evidence }) {
         </div>
       )}
     </li>
+  );
+}
+
+/** Notes for whoever picks this up next: append-only, on the timeline with the rest. */
+function CommentBox({ incidentId, onAdded }: { incidentId: string; onAdded: () => void }) {
+  const [text, setText] = useState('');
+  const add = useMutation({
+    mutationFn: () => post(`/observability/incidents/${incidentId}/comments`, { text }),
+    onSuccess: () => {
+      setText('');
+      onAdded();
+    },
+  });
+  return (
+    <div className="space-y-2 border-t border-hairline px-5 py-3">
+      <textarea
+        className="input min-h-[64px] text-[13px]"
+        value={text}
+        maxLength={4000}
+        placeholder="Add a note: what you checked, what you are trying…"
+        aria-label="Add a note"
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && text.trim()) add.mutate();
+        }}
+      />
+      <div className="flex items-center gap-2">
+        <button className="btn-ghost !min-h-[32px] !text-xs" disabled={!text.trim() || add.isPending} onClick={() => add.mutate()}>
+          {add.isPending ? <Spinner /> : <MessageSquare size={13} />} Add note
+        </button>
+        {add.error && <span className="text-[11px] text-red">{(add.error as Error).message}</span>}
+      </div>
+    </div>
+  );
+}
+
+const HYPOTHESIS: Record<'confirmed' | 'ruled_out' | 'untested', { label: string; tone: string }> = {
+  confirmed: { label: 'Confirmed', tone: 'border-green/30 bg-green/10 text-green' },
+  ruled_out: { label: 'Ruled out', tone: 'border-hairline bg-tile-2 text-muted' },
+  untested: { label: 'Untested', tone: 'border-amber/30 bg-amber/10 text-amber' },
+};
+
+/** Every cause the diagnosis weighed, not only the winner: what was ruled out is evidence too. */
+function Weighed({ hypotheses }: { hypotheses: NonNullable<Detail['incident']['hypotheses']> }) {
+  if (!hypotheses.length) return null;
+  return (
+    <div className="mt-4">
+      <h3 className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">Causes weighed</h3>
+      <ul className="divide-y divide-hairline rounded-inner border border-hairline">
+        {hypotheses.map((h, i) => (
+          <li key={i} className="flex flex-col gap-1 px-3 py-2 sm:flex-row sm:items-start sm:gap-3">
+            <span className={clsx('chip w-fit shrink-0 !text-[10.5px]', HYPOTHESIS[h.verdict].tone)}>{HYPOTHESIS[h.verdict].label}</span>
+            <span className="min-w-0 text-[13px] leading-snug">
+              <span className={clsx(h.verdict === 'ruled_out' ? 'text-muted' : 'text-ink')}>{h.hypothesis}</span>
+              {h.evidence && <span className="block break-words text-xs text-muted">{h.evidence}</span>}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Affected, checked and fine, and not checked: what a person still has to look at is explicit. */
+function BlastRadius({ r }: { r: NonNullable<Detail['incident']['blastRadius']> }) {
+  const rows: Array<[string, string | null, string]> = [
+    ['Affected', r.affected, 'text-red'],
+    ['Checked, healthy', r.healthy, 'text-green'],
+    ['Not checked', r.unchecked, 'text-amber'],
+  ];
+  return (
+    <div className="mt-4">
+      <h3 className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">Blast radius</h3>
+      <dl className="grid gap-x-4 gap-y-1.5 text-[13px] sm:grid-cols-[max-content_1fr]">
+        {rows.filter(([, v]) => v).map(([k, v, tone]) => (
+          <div key={k} className="contents">
+            <dt className={clsx('text-xs font-medium sm:pt-px', tone)}>{k}</dt>
+            <dd className="min-w-0 break-words text-ink/90">{v}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
   );
 }

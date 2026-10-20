@@ -10,14 +10,14 @@ export function Approvers({ approvals, className }: { approvals: RunApprovals; c
   return (
     <span className={className}>
       {approvedBy.length > 0 && (
-        <span className="inline-flex items-center gap-1 whitespace-nowrap" title={`${steps(approvals.approved)} approved`}>
+        <span className="inline-flex max-w-full items-center gap-1" title={`${steps(approvals.approved)} approved`}>
           <Check size={11} className="text-green" aria-hidden />
           approved by <span className="font-medium text-ink">{approvedBy.map((p) => p.name).join(', ')}</span>
         </span>
       )}
       {approvedBy.length > 0 && rejectedBy.length > 0 && <span aria-hidden> · </span>}
       {rejectedBy.length > 0 && (
-        <span className="inline-flex items-center gap-1 whitespace-nowrap" title={`${steps(approvals.denied)} rejected`}>
+        <span className="inline-flex max-w-full items-center gap-1" title={`${steps(approvals.denied)} rejected`}>
           <X size={11} className="text-red" aria-hidden />
           rejected by <span className="font-medium text-ink">{rejectedBy.map((p) => p.name).join(', ')}</span>
         </span>

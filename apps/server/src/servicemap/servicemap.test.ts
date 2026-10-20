@@ -143,3 +143,11 @@ test('incidents: what it depends on (and which is unhealthy), what it affects, a
   assert.match(mapRelation(projectId, [web.id], [dbh.id]) ?? '', /web-1 depends on postgresql on db-1/);
   assert.match(serviceMapContext(projectId, [web.id]) ?? '', /web-1 depends on postgresql on db-1/);
 });
+
+test('a component added with details keeps them (owner, runbook...)', () => {
+  const projectId = db.insert(projects).values({ slug: 'p-attrs', name: 'P', riskPolicy: DEFAULT_RISK_POLICY, createdAt: new Date() }).returning().get().id;
+  const r = applyChange(projectId, { op: 'add_item', payload: { name: 'billing', key: 'billing', type: 'service', attrs: { owner: 'finance-team', runbook_url: 'https://wiki.example.test/billing' } }, origin: 'manual', sourceRef: null, quote: null }, null);
+  assert.ok(r.ok);
+  const row = db.select().from(ciItems).where(eq(ciItems.id, (r as { id: string }).id)).get()!;
+  assert.deepEqual(row.attrs, { owner: 'finance-team', runbook_url: 'https://wiki.example.test/billing' });
+});

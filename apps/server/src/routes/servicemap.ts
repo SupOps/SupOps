@@ -107,6 +107,8 @@ const itemBody = z.object({
   description: z.string().max(1000).nullable().optional(),
   aliases: z.array(z.string().min(1).max(120)).max(40).optional(),
   targetId: z.string().nullable().optional(),
+  /** Details, including the catalogue fields alerts pick up: owner, team, runbook, repo, tier. */
+  attrs: z.record(z.string().max(500)).refine((a) => Object.keys(a).length <= 30, 'At most 30 details').optional(),
 });
 const linkBody = z.object({
   projectId: z.string(),

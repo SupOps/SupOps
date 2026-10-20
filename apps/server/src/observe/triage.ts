@@ -1,11 +1,14 @@
 import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import { agents, alerts, evidence, incidents, observations, runSteps, runs } from '@supops/db';
-import { isTerminalRun } from '@supops/shared';
+import { isTerminalRun, OPEN_ALERT_STATUSES } from '@supops/shared';
 import type { ChatMessage } from '@supops/shared';
-import { checkCitations, loadTargets, parseAction, parseVerdict, runChecks, scopeFromLabels, SEVERITY_RANK, withJumps, withMachinesBehind } from '@supops/core';
+import { changesBlock, checkCitations, loadTargets, parseAction, parseBlastRadius, parseHypotheses, parseVerdict, restatesSymptom, runChecks, scopeFromLabels, SEVERITY_RANK, withJumps, withMachinesBehind } from '@supops/core';
 import type { EvidenceItem } from '@supops/core';
 import { db, settingsStore } from '../context.ts';
 import { startRun } from '../services/start-run.ts';
+import { suspectsFor } from '../changes/store.ts';
+import { incidentServices } from '../changes/incident.ts';
+import { newErrorsBlock } from '../errors/collector.ts';
 import { projectConnections } from './connections.ts';
 import { incidentMapBlock } from '../servicemap/context.ts';
 
@@ -22,6 +25,9 @@ type AlertRow = typeof alerts.$inferSelect;
 
 const queue: string[] = [];
 let draining = false;
+
+/** Incidents waiting for related alerts before they are diagnosed. */
+const gathering = new Set<string>();
 
 export function enqueueTriage(incidentId: string): void {
   if (!queue.includes(incidentId)) queue.push(incidentId);
@@ -118,12 +124,12 @@ export function evidenceBlock(inc: IncidentRow, members: AlertRow[], ev: Array<t
     lines.push('', 'EVIDENCE PACK: no metrics or logs connection could be checked for this incident.');
   }
   if (missing.length) lines.push(`Not measured here: ${[...new Set(missing.map((e) => e.title))].join(', ')}.`);
-  const mapLines = incidentMapBlock(inc.projectId, inc.targetIds ?? [], inc.id);
+  const mapLines = incidentMapBlock(inc.projectId, inc.targetIds ?? [], inc.id, incidentServices(inc, members).services);
   if (mapLines) lines.push('', mapLines);
   return lines.join('\n');
 }
 
-function triageAgentId(projectId: string): string | null {
+export function triageAgentId(projectId: string): string | null {
   const a =
     db.select().from(agents).where(and(eq(agents.projectId, projectId), eq(agents.slug, 'triage'))).get() ??
     db.select().from(agents).where(eq(agents.projectId, projectId)).get();
@@ -158,6 +164,13 @@ export function startIncidentRun(
   const diagnose = opts.mode === 'diagnose';
 
   let block = evidenceBlock(inc, members, ev);
+  // What changed just before: the first suspects (deploys, config, SupOps' own actions).
+  const scope = incidentServices(inc, members);
+  const recent = changesBlock(suspectsFor(inc.projectId, scope));
+  if (recent) block += `\n\n${recent}`;
+  // New kinds of error around when it began: often the first symptom of the cause.
+  const errors = newErrorsBlock(inc.projectId, scope.services, scope.startedAt);
+  if (errors) block += `\n\n${errors}`;
   // The fix starts where the read-only diagnosis ended.
   const prior = !diagnose && inc.runId ? finalAnswer(inc.runId) : null;
   if (prior) block += `\n\nREAD-ONLY DIAGNOSIS ALREADY DONE (by SupOps, automatically, when the incident opened):\n${prior.trim()}`;
@@ -181,7 +194,7 @@ export function startIncidentRun(
     triggerPayload: { incidentId: inc.id, auto: diagnose, phase: opts.mode },
     startedBy: opts.startedBy,
     unattended: diagnose,
-    incident: { evidence: block, mode: opts.mode },
+    incident: { evidence: block, mode: opts.mode, alerts: members.map((a) => ({ title: a.title, severity: a.severity, source: a.source, labels: a.labels })) },
   });
   if (!result.ok) return { ok: false, error: result.error, code: result.code };
 
@@ -211,11 +224,46 @@ export function latestFixRun(incidentId: string): { id: string; status: string; 
 
 const sevRank = (s: string) => SEVERITY_RANK[s === 'unknown' ? 'warning' : s] ?? 0;
 
+/** How a diagnosis held for a flapping alert is marked, so settling knows to start it. */
+export const FLAPPING_NOTE = 'Flapping: firing and resolving over and over. Diagnosed once it settles.';
+
+/** Is any open alert of this incident flapping? Its diagnosis waits until it settles. */
+export function incidentIsFlapping(incidentId: string): boolean {
+  return !!db
+    .select({ id: alerts.id })
+    .from(alerts)
+    .where(and(eq(alerts.incidentId, incidentId), eq(alerts.flapping, true), inArray(alerts.status, [...OPEN_ALERT_STATUSES])))
+    .get();
+}
+
 async function triage(incidentId: string): Promise<void> {
   let inc = db.select().from(incidents).where(eq(incidents.id, incidentId)).get();
   if (!inc || inc.status !== 'open') return;
+  // Waiting for its rule's threshold: diagnosed once enough alerts join.
+  if (inc.held) return;
   // Diagnosed already (e.g. reopened after an ignore): the diagnosis stands.
   if (inc.runId && inc.triageState === 'done') return;
+  // A test alert sent from SupOps: nothing to check or diagnose.
+  const members = db.select({ labels: alerts.labels }).from(alerts).where(eq(alerts.incidentId, incidentId)).all();
+  if (members.length && members.every((m) => m.labels?.supops_test === 'true')) {
+    db.update(incidents).set({ triageState: 'skipped', triageNote: 'A test alert sent from SupOps: nothing to diagnose.' }).where(eq(incidents.id, incidentId)).run();
+    return;
+  }
+  if (incidentIsFlapping(incidentId)) {
+    db.update(incidents).set({ triageState: 'skipped', triageNote: FLAPPING_NOTE }).where(eq(incidents.id, incidentId)).run();
+    return;
+  }
+  // Problems rarely arrive as one alert: wait a few minutes after the incident opens so
+  // related alerts join it, and diagnose the whole picture once.
+  const gatherMs = settingsStore.observability().triageGatherSeconds * 1000;
+  const waited = Date.now() - inc.openedAt.getTime();
+  if (inc.origin === 'alerts' && !inc.runId && waited < gatherMs) {
+    if (!gathering.has(incidentId)) {
+      gathering.add(incidentId);
+      setTimeout(() => { gathering.delete(incidentId); enqueueTriage(incidentId); }, gatherMs - waited).unref();
+    }
+    return;
+  }
   db.update(incidents).set({ triageState: 'evidence' }).where(eq(incidents.id, inc.id)).run();
   await gatherEvidence(inc);
   inc = db.select().from(incidents).where(eq(incidents.id, incidentId)).get()!;
@@ -268,11 +316,24 @@ export function reconcileTriage(): void {
     if (run.status !== 'succeeded' && run.status !== 'awaiting_input') notes.push(`The investigation ended: ${run.status}.`);
     if (cites.unknown.length) notes.push(`Cites evidence that does not exist: ${cites.unknown.join(', ')} -- treat those claims as unverified.`);
     if (!verdict.rootCause && text) notes.push('The report did not state a root cause.');
+    // A symptom is never the root cause: one that only restates what fired is kept,
+    // marked, and its confidence capped, so it is not read as an explanation.
+    let confidence = verdict.confidence;
+    if (verdict.rootCause) {
+      const titles = db.select({ title: alerts.title }).from(alerts).where(eq(alerts.incidentId, inc.id)).all().map((a) => a.title);
+      if (restatesSymptom(verdict.rootCause, [inc.title, ...titles])) {
+        notes.push('The root cause only restates what fired (a symptom); it does not say what made it happen. Treat it as unexplained.');
+        if (confidence === 'high' || confidence === 'medium') confidence = 'low';
+      }
+    }
+    const hypotheses = parseHypotheses(text);
     db.update(incidents)
       .set({
         triageState: 'done',
         rootCause: verdict.rootCause,
-        confidence: verdict.confidence,
+        confidence,
+        hypotheses: hypotheses.length ? hypotheses : null,
+        blastRadius: parseBlastRadius(text),
         action: parseAction(text),
         triageNote: notes.join(' ') || null,
       })

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { clsx } from 'clsx';
@@ -349,6 +349,18 @@ function ItemDetail({
         </div>
       )}
       {item.description && <p className="mt-3 text-[12.5px] leading-relaxed text-ink/90">{item.description}</p>}
+      {CATALOGUE.some(([k]) => item.attrs[k]) && (
+        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
+          {CATALOGUE.filter(([k]) => item.attrs[k]).map(([k, label]) => (
+            <Fragment key={k}>
+              <dt className="text-muted">{label}</dt>
+              <dd className="min-w-0 break-words text-ink">
+                {/^https?:\/\//.test(item.attrs[k]!) ? <a className="text-blue-text hover:underline" href={item.attrs[k]} target="_blank" rel="noreferrer">{item.attrs[k]}</a> : item.attrs[k]}
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
       {item.aliases.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1">{item.aliases.slice(0, 12).map((a) => <span key={a} className="rounded bg-tile-2 px-1.5 py-0.5 font-mono text-[10.5px] text-muted">{a}</span>)}</div>
       )}
@@ -574,13 +586,26 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
 }
 
 const TYPES = Object.keys(TYPE_META) as CiType[];
+
+/** The service catalogue: details alerts about a component pick up as labels. */
+const CATALOGUE = [
+  ['owner', 'Owner', 'Ana'],
+  ['team', 'Team', 'payments'],
+  ['runbook', 'Runbook', 'https://wiki.example.com/runbooks/checkout'],
+  ['repo', 'Repository', 'https://git.example.com/shop/checkout'],
+  ['tier', 'Tier', 'critical'],
+] as const;
+type CatalogueKey = (typeof CATALOGUE)[number][0];
 const KINDS = Object.keys(KIND_LABEL) as CiLinkKind[];
 
 function ItemForm({ projectId, existing, onDone }: { projectId: string; existing?: MapItem; onDone: (msg?: string) => void }) {
   const [f, setF] = useState({ name: existing?.name ?? '', type: existing?.type ?? ('service' as CiType), env: existing?.env ?? '', description: existing?.description ?? '', aliases: (existing?.aliases ?? []).join(', ') });
+  const [cat, setCat] = useState<Record<CatalogueKey, string>>(() => Object.fromEntries(CATALOGUE.map(([k]) => [k, existing?.attrs[k] ?? ''])) as Record<CatalogueKey, string>);
   const save = useMutation({
     mutationFn: () => {
-      const body = { name: f.name.trim(), type: f.type, env: f.env.trim() || null, description: f.description.trim() || null, aliases: f.aliases.split(',').map((a) => a.trim()).filter(Boolean) };
+      // Details are saved whole: keep the others, set or clear the catalogue fields.
+      const attrs = { ...Object.fromEntries(Object.entries(existing?.attrs ?? {}).filter(([k]) => !CATALOGUE.some(([c]) => c === k))), ...Object.fromEntries(Object.entries(cat).map(([k, v]) => [k, v.trim()]).filter(([, v]) => v)) };
+      const body = { name: f.name.trim(), type: f.type, env: f.env.trim() || null, description: f.description.trim() || null, aliases: f.aliases.split(',').map((a) => a.trim()).filter(Boolean), attrs };
       return existing ? patch<{ applied: boolean; message?: string }>(`/service-map/items/${existing.id}`, body) : post<{ applied: boolean; message?: string }>('/service-map/items', { projectId, ...body });
     },
     onSuccess: (r) => onDone(r.applied ? undefined : r.message),
@@ -596,6 +621,14 @@ function ItemForm({ projectId, existing, onDone }: { projectId: string; existing
       </div>
       <Field label="What it is"><textarea className="input min-h-[60px]" value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} /></Field>
       <Field label="Other names" hint="Hostnames, IPs, scrape jobs, Kubernetes names -- comma separated. They let live sources find it."><input className="input font-mono text-[12px]" value={f.aliases} onChange={(e) => setF({ ...f, aliases: e.target.value })} placeholder="10.0.4.21, checkout.prod.internal" /></Field>
+      <div className="rounded-inner border border-hairline bg-ground/40 p-3">
+        <p className="mb-2 text-[11px] leading-relaxed text-muted">Who owns it. Alerts about this component get these as labels (<span className="font-mono">owner</span>, <span className="font-mono">team</span>, <span className="font-mono">runbook_url</span>…), so they can be grouped and routed by team.</p>
+        <div className="grid grid-cols-2 gap-3">
+          {CATALOGUE.map(([k, label, ph]) => (
+            <Field key={k} label={label}><input className="input text-[12px]" value={cat[k]} onChange={(e) => setCat({ ...cat, [k]: e.target.value })} placeholder={ph} /></Field>
+          ))}
+        </div>
+      </div>
       {existing && !existing.locked && <p className="text-[11px] text-dim">Once you edit it, automatic sources add evidence but never change what you set.</p>}
       {save.isError && <p className="text-sm text-red">{(save.error as Error).message}</p>}
       <button className="btn-primary" disabled={!f.name.trim() || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <Spinner /> : <Check size={14} />} Save</button>

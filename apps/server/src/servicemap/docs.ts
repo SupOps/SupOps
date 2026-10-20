@@ -156,7 +156,9 @@ export function applyChange(projectId: string, p: Pick<Proposal, 'op' | 'payload
   switch (p.op) {
     case 'add_item': {
       const row = upsertItem(projectId, { key: String(pl.key ?? keyFor(String(pl.name))), name: String(pl.name), type: (pl.type as CiType) ?? 'service', env: (pl.env as string) ?? null, description: (pl.description as string) ?? null, aliases: (pl.aliases as string[]) ?? [], targetId: (pl.targetId as string) ?? null }, ev);
-      db.update(ciItems).set({ status: 'approved', locked: true, updatedBy: userId, updatedAt: now }).where(eq(ciItems.id, row.id)).run();
+      // Details given with it (owner, team, runbook, repo, tier...) are kept, merged over any it had.
+      const attrs = pl.attrs && typeof pl.attrs === 'object' ? { ...row.attrs, ...(pl.attrs as Record<string, string>) } : undefined;
+      db.update(ciItems).set({ status: 'approved', locked: true, updatedBy: userId, updatedAt: now, ...(attrs ? { attrs } : {}) }).where(eq(ciItems.id, row.id)).run();
       return { ok: true, id: row.id };
     }
     case 'update_item': {
