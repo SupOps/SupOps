@@ -47,6 +47,15 @@ export const config = {
     .split(',')
     .map((d) => d.trim().toLowerCase())
     .filter(Boolean),
+  /**
+   * Other origins allowed to call the API from a browser (comma-separated), e.g. a
+   * separate dashboard. Empty = same origin only: the built UI is served from this
+   * port and `npm run dev` proxies through Vite, so neither needs CORS.
+   */
+  corsOrigins: (process.env.CORS_ORIGINS ?? '')
+    .split(',')
+    .map((o) => o.trim().replace(/\/+$/, ''))
+    .filter(Boolean),
   llm: {
     baseUrl: process.env.LLM_BASE_URL ?? 'https://generativelanguage.googleapis.com/v1beta/openai/',
     apiKey: process.env.LLM_API_KEY ?? '',

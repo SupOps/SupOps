@@ -1,6 +1,7 @@
 import { eq } from 'drizzle-orm';
 import {
   HEALTH_SETTINGS_KEY,
+  LEARNING_SETTINGS_KEY,
   OBSERVABILITY_SETTINGS_KEY,
   RETENTION_SETTINGS_KEY,
   LLM_SETTINGS_KEY,
@@ -10,7 +11,7 @@ import {
   settings,
   unpackEnvelope,
 } from '@supops/db';
-import type { StoredHealthSettings, StoredLlmSettings, StoredObservabilitySettings, StoredRetentionSettings } from '@supops/db';
+import type { StoredHealthSettings, StoredLearningSettings, StoredLlmSettings, StoredObservabilitySettings, StoredRetentionSettings } from '@supops/db';
 import type { Db } from '@supops/db';
 import type { LLMConfig } from '@supops/core';
 import { config } from './config.ts';
@@ -152,9 +153,13 @@ export class SettingsStore {
       watchIntervalMs: stored.watchIntervalMs ?? 5 * 60_000,
       autoTriage: stored.autoTriage ?? true,
       triageMinSeverity: stored.triageMinSeverity ?? 'info',
+      triageGatherSeconds: stored.triageGatherSeconds ?? 180,
       triageMaxPerHour: stored.triageMaxPerHour ?? 20,
       predictWarningHours: stored.predictWarningHours ?? 24,
       predictCriticalHours: stored.predictCriticalHours ?? 4,
+      flapChanges: stored.flapChanges ?? 4,
+      flapWindowMin: stored.flapWindowMin ?? 30,
+      slackThreadReplies: stored.slackThreadReplies ?? false,
     };
   }
 
@@ -163,6 +168,22 @@ export class SettingsStore {
     this.db
       .insert(settings)
       .values({ key: OBSERVABILITY_SETTINGS_KEY, value: next, updatedAt: new Date() })
+      .onConflictDoUpdate({ target: settings.key, set: { value: next, updatedAt: new Date() } })
+      .run();
+    return next;
+  }
+
+  learning(): StoredLearningSettings {
+    const row = this.db.select().from(settings).where(eq(settings.key, LEARNING_SETTINGS_KEY)).get();
+    const stored = (row?.value as Partial<StoredLearningSettings> | undefined) ?? {};
+    return { reflect: stored.reflect ?? 'drafts', reflectMinActions: stored.reflectMinActions ?? 3 };
+  }
+
+  saveLearning(patch: Partial<StoredLearningSettings>): StoredLearningSettings {
+    const next: StoredLearningSettings = { ...this.learning(), ...patch };
+    this.db
+      .insert(settings)
+      .values({ key: LEARNING_SETTINGS_KEY, value: next, updatedAt: new Date() })
       .onConflictDoUpdate({ target: settings.key, set: { value: next, updatedAt: new Date() } })
       .run();
     return next;

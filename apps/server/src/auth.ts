@@ -2,6 +2,7 @@ import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from './config.ts';
+import { verifyApiKey } from './apikeys.ts';
 
 /**
  * scrypt rather than argon2: argon2 needs a native build, and this machine (like
@@ -36,6 +37,8 @@ declare global {
   namespace Express {
     interface Request {
       user?: AuthUser;
+      /** Set when the request came with an API key instead of a session. */
+      apiKey?: { id: string; name: string; scopes: Array<'read' | 'investigate' | 'changes' | 'metrics' | 'mcp'> };
     }
   }
 }
@@ -58,6 +61,18 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) {
     res.status(401).json({ error: 'Not signed in' });
+    return;
+  }
+  // A machine's API key (sok_...): acts as a member, within its scopes (see apiKeyGate).
+  if (token.startsWith('sok_')) {
+    const k = verifyApiKey(token);
+    if (!k) {
+      res.status(401).json({ error: 'Unknown, revoked or expired API key' });
+      return;
+    }
+    req.user = k.user;
+    req.apiKey = k.key;
+    next();
     return;
   }
   const user = verifySessionToken(token);

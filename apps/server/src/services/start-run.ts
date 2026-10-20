@@ -8,10 +8,13 @@ import {
   effectiveToolKeys,
   mergePolicy,
   buildKnowledgeContext,
+  renderSkills,
+  selectSkills,
   buildOpeningMessage,
   buildSystemPrompt,
   loadTargets,
   KNOWLEDGE_TOOL_KEYS,
+  SESSION_TOOL_KEYS,
   netCheckTool,
   NETWORK_TARGET,
   OBSERVABILITY_TOOL_KEYS,
@@ -19,7 +22,9 @@ import {
 } from '@supops/core';
 import { isObservabilityKind } from '@supops/shared';
 import { db, engine, registry, settingsStore } from '../context.ts';
-import { observationContext } from '../observe/context.ts';
+import type { AlertLike } from '@supops/core';
+import { coverageContext, observationContext } from '../observe/context.ts';
+import { mcpToolsForRun } from '../mcp/manager.ts';
 import { serviceMapContext } from '../servicemap/context.ts';
 import { worker } from '../worker.ts';
 
@@ -56,7 +61,8 @@ export interface StartRunInput {
   /** Advisory runs only: allow read-only network checks from the SupOps server. Default true. */
   networkChecks?: boolean;
   /** An incident investigation: its alerts and evidence pack go in the opening message. */
-  incident?: { evidence: string; mode?: 'diagnose' | 'fix' };
+  /** The incident's evidence, and its alerts (a runbook written for them is given to follow). */
+  incident?: { evidence: string; mode?: 'diagnose' | 'fix'; alerts?: AlertLike[] };
   /**
    * A live call with a client who gives no access: always advisory, conversational
    * (see CALL_PROMPT), network checks off unless asked for.
@@ -118,8 +124,11 @@ export function startRun(input: StartRunInput): StartRunResult {
   // Cluster targets are just another way to reach infrastructure: an agent allowed to
   // run commands on machines (ssh_exec) may run kubectl on clusters too. Agents saved
   // before cluster targets existed get it here rather than via a data migration.
+  // MCP tools are listed by their own keys (or mcp_<server>_*) and come from the
+  // project's servers; everything else resolves through the registry as before.
+  const agentKeys = agent.toolKeys ?? null;
   const resolved = registry
-    .resolve(effectiveToolKeys(agent.toolKeys ?? null))
+    .resolve(effectiveToolKeys(agentKeys?.filter((k) => !k.startsWith('mcp_')) ?? null))
     .filter((d) => !KNOWLEDGE_TOOL_KEYS.includes(d.key) && !(input.unattended && d.key === 'confirm_target'));
   // A call is about the client's systems, not ours: checks from the SupOps server only when asked for.
   const networkChecks = advisory && (call ? input.networkChecks === true : input.networkChecks !== false);
@@ -132,12 +141,14 @@ export function startRun(input: StartRunInput): StartRunResult {
     .where(and(eq(knowledgeDocs.projectId, projectId), eq(knowledgeDocs.status, 'approved')))
     .get();
   const knowledgeTools = hasKnowledge ? KNOWLEDGE_TOOL_KEYS.map((k) => registry.get(k)!).filter(Boolean) : [];
+  // SupOps' own tools about the run (read more of a long result, keep a plan): every run, whatever its agent.
+  const sessionTools = SESSION_TOOL_KEYS.map((k) => registry.get(k)!).filter(Boolean);
   const tools = advisory
     ? [
-        ...bindTools([...(networkChecks ? [netCheckTool as never] : []), ...knowledgeTools], [NETWORK_TARGET]),
+        ...bindTools([...(networkChecks ? [netCheckTool as never] : []), ...knowledgeTools, ...sessionTools], [NETWORK_TARGET]),
         ...bindTools(OBSERVABILITY_TOOL_KEYS.map((k) => registry.get(k)!).filter(Boolean), targets),
       ].sort((a, b) => a.def.key.localeCompare(b.def.key))
-    : bindTools([...resolved, ...knowledgeTools], targets);
+    : bindTools([...resolved.filter((d) => !SESSION_TOOL_KEYS.includes(d.key)), ...knowledgeTools, ...sessionTools, ...mcpToolsForRun(projectId, agentKeys)], targets);
   const targetSummaries = targets.map((t) => ({
     slug: t.slug,
     kind: t.kind,
@@ -146,7 +157,11 @@ export function startRun(input: StartRunInput): StartRunResult {
     ...(t.config.kind === 'ssh' && t.config.addresses?.length ? { addresses: t.config.addresses } : {}),
   }));
 
-  const system = buildSystemPrompt(project.systemPromptExtra, agent.systemPrompt, {
+  // Domain playbooks for what this run touches (frozen into the system snapshot).
+  // An advisory run touches nothing, so its playbooks come from the task alone.
+  // SUPOPS_PLAYBOOKS=off drops them (they add prompt weight that can distract a weak model).
+  const playbooks = process.env.SUPOPS_PLAYBOOKS === 'off' ? '' : renderSkills(selectSkills({ kinds: [...new Set(targets.map((t) => t.kind))], task }));
+  const system = buildSystemPrompt(project.systemPromptExtra, agent.systemPrompt, playbooks, {
     advisory,
     networkChecks,
     observability: advisory && targets.length > 0,
@@ -203,6 +218,7 @@ export function startRun(input: StartRunInput): StartRunResult {
     scope: advisory ? 'all' : { targetIds: targets.map((t) => t.id), kinds: [...new Set(targets.map((t) => t.kind))], envs: [...new Set(targets.map((t) => t.env))] },
     task,
     runbookId: input.runbookId ?? null,
+    ...(input.incident?.alerts?.length ? { alerts: input.incident.alerts } : {}),
   });
 
   const opening = buildOpeningMessage({
@@ -220,6 +236,7 @@ export function startRun(input: StartRunInput): StartRunResult {
     evidence: input.incident?.evidence,
     observations: observationContext(projectId, targets.map((t) => t.id)) ?? undefined,
     serviceMap: serviceMapContext(projectId, targetIds?.length ? targets.map((t) => t.id) : []) ?? undefined,
+    dataSources: coverageContext(projectId, targets.map((t) => t.id)),
   });
   const imageIds = input.images?.length ? saveImages(run.id, input.images, input.startedBy ?? null) : [];
   engine.store.appendStep(run.id, { role: 'user', content: userContent(opening, imageIds) });

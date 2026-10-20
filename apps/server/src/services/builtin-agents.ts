@@ -1,6 +1,6 @@
 import { and, eq } from 'drizzle-orm';
 import { DEFAULT_RUN_BUDGET, agents, projects } from '@supops/db';
-import { BUILTIN_TOOL_KEYS, CONSOLE_TOOL_KEYS } from '@supops/core';
+import { BUILTIN_TOOL_KEYS, CONSOLE_TOOL_KEYS, TRIAGE_AGENT_PROMPT } from '@supops/core';
 import { db } from '../context.ts';
 import { HEALTH_AGENT_SPECS, ensureScanAgent } from './health.ts';
 
@@ -19,11 +19,7 @@ export const BUILTIN_AGENTS = [
     name: 'Triage Agent',
     role: 'triage',
     toolKeys: BUILTIN_TOOL_KEYS,
-    systemPrompt:
-      'You are triaging an incident. Work the problem from evidence: check service ' +
-      'status, recent logs, resource pressure and recent changes before forming a ' +
-      'hypothesis. State your conclusion with record_finding before proposing any ' +
-      'change. Prefer the smallest reversible action that addresses the cause.',
+    systemPrompt: TRIAGE_AGENT_PROMPT,
   },
   {
     slug: 'console',

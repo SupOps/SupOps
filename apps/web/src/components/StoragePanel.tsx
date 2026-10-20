@@ -251,6 +251,7 @@ export function StoragePanel({ canEdit }: { canEdit: boolean }) {
             )}
           </>
         )}
+        {canEdit && <Backups />}
       </div>
     </Panel>
   );
@@ -276,6 +277,37 @@ function Row({ label, hint, children }: { label: string; hint?: string; children
         {hint && <div className="text-[11px] text-muted">{hint}</div>}
       </div>
       {children}
+    </div>
+  );
+}
+
+/** The database's scheduled backups, newest first, and one on demand. */
+function Backups() {
+  const qc = useQueryClient();
+  const q = useQuery({ queryKey: ['backups'], queryFn: () => api<{ dir: string; everyHours: number; keep: number; backups: Array<{ file: string; bytes: number; at: number }>; last: { ok: boolean; error?: string } | null }>('/maintenance/backups') });
+  const now = useMutation({ mutationFn: () => post('/maintenance/backups', {}), onSuccess: () => void qc.invalidateQueries({ queryKey: ['backups'] }) });
+  const d = q.data;
+  return (
+    <div className="mt-5 border-t border-hairline pt-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <h3 className="text-sm font-medium text-ink">Backups</h3>
+        <span className="text-[11px] text-muted">
+          {d ? (d.everyHours ? `Every ${d.everyHours} h, the newest ${d.keep} kept, in ${d.dir}` : 'Scheduled backups are off (SUPOPS_BACKUP_EVERY_HOURS=0).') : ''}
+        </span>
+        <button className="btn-ghost ml-auto !min-h-[32px] !text-xs" disabled={now.isPending} onClick={() => now.mutate()}>{now.isPending ? <Spinner /> : <HardDrive size={13} />} Back up now</button>
+      </div>
+      {d?.last && !d.last.ok && <p className="mt-2 text-xs text-red">The last scheduled backup failed: {d.last.error}</p>}
+      {now.error && <p className="mt-2 text-xs text-red">{(now.error as Error).message}</p>}
+      {d?.backups.length ? (
+        <ul className="mt-2 space-y-1 text-xs">
+          {d.backups.map((b) => (
+            <li key={b.file} className="flex flex-wrap gap-x-3 font-mono text-muted"><span className="break-all text-ink/85">{b.file}</span><span>{formatBytes(b.bytes)}</span><span>{timeAgo(new Date(b.at).toISOString())}</span></li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-2 text-xs text-muted">No backup yet.</p>
+      )}
+      <p className="mt-2 text-[11px] text-muted">Secrets in a backup stay encrypted with the master key: keep SUPOPS_MASTER_KEY safe separately, or the backup cannot be read.</p>
     </div>
   );
 }

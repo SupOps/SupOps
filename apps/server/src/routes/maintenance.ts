@@ -8,6 +8,7 @@ import { config } from '../config.ts';
 import { db, settingsStore, sqlite } from '../context.ts';
 import { previewHistoryCleanup, runHistoryCleanup } from '../services/retention.ts';
 import { audit } from '../services/audit.ts';
+import { backupNow, backupScheduler, backupSettings, listBackups } from '../backup.ts';
 
 /**
  * Storage and history retention. Reading the numbers is open to any signed-in user
@@ -92,4 +93,27 @@ maintenanceRoutes.post('/cleanup', (req, res) => {
       res.json(r);
     })
     .catch((err: unknown) => res.status(409).json({ error: err instanceof Error ? err.message : 'Clean-up failed' }));
+});
+
+/** The database's backups, and a backup on demand. Admins only: a backup holds everything. */
+maintenanceRoutes.get('/backups', (req, res) => {
+  if (!isAdmin(req.user)) {
+    res.status(403).json({ error: 'Only an admin can see backups.' });
+    return;
+  }
+  const s = backupSettings();
+  res.json({ ...s, backups: listBackups(s.dir), last: backupScheduler.last });
+});
+
+maintenanceRoutes.post('/backups', (req, res) => {
+  if (!isAdmin(req.user)) {
+    res.status(403).json({ error: 'Only an admin can make a backup.' });
+    return;
+  }
+  backupNow()
+    .then((r) => {
+      audit(req.user, { entity: 'backup', action: 'create', after: { file: r.file, bytes: r.bytes } });
+      res.status(201).json(r);
+    })
+    .catch((err: unknown) => res.status(500).json({ error: err instanceof Error ? err.message : 'The backup failed' }));
 });
