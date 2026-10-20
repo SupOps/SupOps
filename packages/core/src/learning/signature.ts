@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { lexShell } from '../risk/shell-lex.ts';
+import { scriptForClassification } from '../tools/script.ts';
 import { stripLeadingElevation } from '../tools/become.ts';
 
 /**
@@ -61,6 +63,11 @@ export function signatureOf(toolKey: string, args: Record<string, unknown>): str
   else if (toolKey === 'k8s_kubectl' && typeof args.args === 'string') line = `kubectl ${args.args.replace(/^kubectl\s+/, '')}`;
   else if ((toolKey === 'ssh_write_file' || toolKey === 'ssh_read_file') && typeof args.path === 'string') {
     return `${SIGNATURE_VERSION}|${toolKey}|${args.path}`;
+  } else if (toolKey === 'run_script' && typeof args.script === 'string') {
+    // A shell script is signed by the lines that do something; Python, which cannot
+    // be read that way, by its exact text.
+    if (args.interpreter === 'python3') return `${SIGNATURE_VERSION}|run_script|python3|${createHash('sha256').update(args.script.trim()).digest('hex').slice(0, 16)}`;
+    line = scriptForClassification(args.script);
   }
   if (!line) return null;
   const lex = lexShell(line);
